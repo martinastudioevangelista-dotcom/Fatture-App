@@ -8,22 +8,8 @@ import google.generativeai as genai
 # Configura la chiave di Google Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-def ottieni_modello_disponibile():
-    # Chiede a Google quali modelli sono attivi sul tuo account
-    try:
-        modelli = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Cerca prioritariamente flash o pro
-        for nome in modelli:
-            if 'flash' in nome:
-                return genai.GenerativeModel(nome)
-        for nome in modelli:
-            if 'pro' in nome:
-                return genai.GenerativeModel(nome)
-        if modelli:
-            return genai.GenerativeModel(modelli[0])
-    except Exception:
-        pass
-    return genai.GenerativeModel('gemini-1.5-flash')
+# Usiamo esattamente il modello richiesto da Google nel messaggio
+model = genai.GenerativeModel('gemini-3.8-flash')
 
 def pdf_to_image(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -35,7 +21,6 @@ def pdf_to_image(pdf_bytes):
 
 def estrai_dati_fattura(pdf_bytes):
     image = pdf_to_image(pdf_bytes)
-    model = ottieni_modello_disponibile()
     
     prompt = """
     Sei un esperto contabile italiano. Analizza l'immagine di questa fattura ed estrai i dati in formato JSON.
