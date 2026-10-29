@@ -7,7 +7,9 @@ import streamlit as st
 import json
 
 def get_drive_service():
-    creds_json = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+    raw_creds = st.secrets["GCP_SERVICE_ACCOUNT"]
+    # strict=False permette di ignorare gli "a capo" della chiave privata senza dare errore
+    creds_json = json.loads(raw_creds, strict=False)
     creds = service_account.Credentials.from_service_account_info(
         creds_json, scopes=['https://www.googleapis.com/auth/drive.file']
     )
