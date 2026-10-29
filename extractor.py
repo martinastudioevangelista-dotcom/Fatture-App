@@ -8,14 +8,23 @@ import google.generativeai as genai
 # Configura la chiave di Google Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-# Usiamo esattamente il modello richiesto da Google nel messaggio
-model = genai.GenerativeModel('gemini-3.8-flash')
+# Impostazioni ultra-veloci: temperatura bassa e output JSON diretto
+generation_config = {
+    "temperature": 0.1,
+    "response_mime_type": "application/json",
+}
+
+model = genai.GenerativeModel(
+    model_name='gemini-3.8-flash',
+    generation_config=generation_config
+)
 
 def pdf_to_image(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=150)
-    img_data = pix.tobytes("png")
+    # DPI a 130 e formato JPEG: immagine 4 volte più leggera e veloce da spedire ai server
+    pix = page.get_pixmap(dpi=130)
+    img_data = pix.tobytes("jpeg")
     image = Image.open(io.BytesIO(img_data))
     return image
 
@@ -23,10 +32,8 @@ def estrai_dati_fattura(pdf_bytes):
     image = pdf_to_image(pdf_bytes)
     
     prompt = """
-    Sei un esperto contabile italiano. Analizza l'immagine di questa fattura ed estrai i dati in formato JSON.
-    Devi riconoscere in modo intelligente i campi anche se usano sinonimi (es. P.IVA, Partita IVA, VAT).
-    
-    Restituisci SOLO ED ESCLUSIVAMENTE codice JSON valido. Struttura richiesta esatta:
+    Estrai i dati contabili da questa fattura italiana in formato JSON.
+    Campi obbligatori:
     {
       "fornitore": {"ragione_sociale": "", "partita_iva": "", "codice_fiscale": "", "indirizzo": "", "cap": "", "comune": "", "provincia": ""},
       "cliente": {"ragione_sociale": "", "partita_iva": "", "codice_fiscale": "", "indirizzo": "", "cap": "", "comune": "", "provincia": ""},
@@ -36,15 +43,7 @@ def estrai_dati_fattura(pdf_bytes):
       ],
       "totale_documento": 0.0
     }
-    Se un dato non è presente, lascia stringa vuota o 0.0. I numeri devono usare il punto per i decimali.
     """
 
     response = model.generate_content([prompt, image])
-    
-    testo_risposta = response.text
-    if testo_risposta.startswith("```json"):
-        testo_risposta = testo_risposta.replace("```json\n", "").replace("\n```", "")
-    elif testo_risposta.startswith("```"):
-        testo_risposta = testo_risposta.replace("```\n", "").replace("\n```", "")
-        
-    return json.loads(testo_risposta)
+    return json.loads(response.text)
