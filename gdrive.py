@@ -30,4 +30,17 @@ def find_or_create_folder(service, folder_name, parent_id=None):
     return items[0]['id']
 
 def upload_to_drive(pdf_bytes, xml_string, nome_cliente, filename_base):
-    service = get_
+    service = get_drive_service()
+    
+    # Struttura: "Fatture_App" -> "Nome Cliente" -> "YYYY-MM"
+    root_id = find_or_create_folder(service, "Fatture_App")
+    cliente_id = find_or_create_folder(service, nome_cliente, root_id)
+    mese_id = find_or_create_folder(service, datetime.date.today().strftime("%Y-%m"), cliente_id)
+    
+    # Upload PDF
+    media_pdf = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype='application/pdf', resumable=True)
+    service.files().create(body={'name': f"{filename_base}.pdf", 'parents': [mese_id]}, media_body=media_pdf).execute()
+    
+    # Upload XML
+    media_xml = MediaIoBaseUpload(io.BytesIO(xml_string.encode('utf-8')), mimetype='application/xml', resumable=True)
+    service.files().create(body={'name': f"{filename_base}.xml", 'parents': [mese_id]}, media_body=media_xml).execute()
