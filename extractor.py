@@ -5,35 +5,27 @@ import json
 import streamlit as st
 import google.generativeai as genai
 
-# Configura la chiave di Google Gemini
+# Configura Google Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-# Impostazioni ultra-veloci: temperatura bassa e output JSON diretto
+# Modalità JSON nativa: costringe Google a rispondere all'istante senza fronzoli
 generation_config = {
     "temperature": 0.1,
     "response_mime_type": "application/json",
 }
-
-model = genai.GenerativeModel(
-    model_name='gemini-3.8-flash',
-    generation_config=generation_config
-)
-
-def pdf_to_image(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    # DPI a 130 e formato JPEG: immagine 4 volte più leggera e veloce da spedire ai server
-    pix = page.get_pixmap(dpi=130)
-    img_data = pix.tobytes("jpeg")
-    image = Image.open(io.BytesIO(img_data))
-    return image
+model = genai.GenerativeModel('gemini-3.8-flash', generation_config=generation_config)
 
 def estrai_dati_fattura(pdf_bytes):
-    image = pdf_to_image(pdf_bytes)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(0)
+    
+    # ⚡ ACCELERAZIONE: se il PDF ha testo digitale, lo legge all'istante
+    testo_digitale = page.get_text()
     
     prompt = """
-    Estrai i dati contabili da questa fattura italiana in formato JSON.
-    Campi obbligatori:
+    Sei un esperto contabile. Estrai i dati della fattura in formato JSON esatto.
+    Riconosci sinonimi di fornitore, cliente, date e totali.
+    Schema JSON:
     {
       "fornitore": {"ragione_sociale": "", "partita_iva": "", "codice_fiscale": "", "indirizzo": "", "cap": "", "comune": "", "provincia": ""},
       "cliente": {"ragione_sociale": "", "partita_iva": "", "codice_fiscale": "", "indirizzo": "", "cap": "", "comune": "", "provincia": ""},
@@ -43,7 +35,17 @@ def estrai_dati_fattura(pdf_bytes):
       ],
       "totale_documento": 0.0
     }
+    Se un dato manca, lascia stringa vuota o 0.0 per i numeri.
     """
 
-    response = model.generate_content([prompt, image])
+    # Se c'è testo digitale usiamo la modalità testo ultra-rapida (1-2 secondi!)
+    if len(testo_digitale.strip()) > 60:
+        response = model.generate_content([prompt, f"Contenuto fattura:\n{testo_digitale}"])
+    else:
+        # Se è una scansione/fotocopia cartacea, usa la fotocamera a bassa risoluzione
+        pix = page.get_pixmap(dpi=80)
+        img_data = pix.tobytes("jpeg", jpg_quality=60)
+        image = Image.open(io.BytesIO(img_data))
+        response = model.generate_content([prompt, image])
+
     return json.loads(response.text)
