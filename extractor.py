@@ -1,155 +1,173 @@
-import fitz  # PyMuPDF
+# extractor.py - Motore Ibrido di Estrazione Fiscale
 import re
+import fitz  # PyMuPDF
 import json
+from datetime import datetime
 import streamlit as st
-import google.generativeai as genai
 
-# Configurazione Google per eventuale fallback su fotocopie
-try:
-    genai.configure(api_key=st.secrets.get("GEMINI_API_KEY", ""))
-    model = genai.GenerativeModel('gemini-3.8-flash')
-except Exception:
-    model = None
-
-def parse_numero_italiano(testo):
-    """Pulisce e converte numeri in formato italiano (es. 2.620,00 o 576,40) in float"""
-    if not testo:
+def parse_importo(val_str: str) -> float:
+    """Converte stringhe numeriche contabili (es. 1.250,50 o 1250.50) in float."""
+    if not val_str:
         return 0.0
-    testo = testo.replace('€', '').replace('EUR', '').strip()
-    if '.' in testo and ',' in testo:
-        testo = testo.replace('.', '').replace(',', '.')
-    elif ',' in testo:
-        testo = testo.replace(',', '.')
+    val_str = str(val_str).strip().replace("€", "").replace(" ", "")
+    # Se presente virgola come decimale
+    if "," in val_str and "." in val_str:
+        if val_str.rfind(",") > val_str.rfind("."):
+            val_str = val_str.replace(".", "").replace(",", ".")
+        else:
+            val_str = val_str.replace(",", "")
+    elif "," in val_str:
+        val_str = val_str.replace(",", ".")
     try:
-        return float(re.findall(r"[-+]?\d*\.\d+|\d+", testo)[0])
-    except Exception:
+        return round(float(val_str), 2)
+    except ValueError:
         return 0.0
 
-def estrazione_locale_istantanea(testo):
-    """Estrae i dati contabili in 0.1 secondi analizzando la struttura del testo"""
-    linee = [l.strip() for l in testo.split('\n') if l.strip()]
-    testo_completo = " ".join(linee)
+def trova_tripletta_matematica(numeri: list) -> tuple:
+    """
+    Individua tra tutti i numeri estratti la tripletta (A=Imponibile, B=IVA, C=Totale)
+    tale che |(A + B) - C| <= 0.02 e B/A corrisponde a un'aliquota italiana reale (4, 5, 10, 22%).
+    """
+    numeri_validi = sorted(list(set(n for n in numeri if 0.01 <= n < 1_000_000.0)), reverse=True)
+    aliquote_valide = [4.0, 5.0, 10.0, 22.0]
 
-    # 1. Trova Partite IVA (11 cifre) e Codici Fiscali
-    piva_trovate = re.findall(r'\b\d{11}\b', testo_completo)
-    cf_trovati = re.findall(r'\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b', testo_completo)
+    for c in numeri_validi:  # C = Totale (valore più alto)
+        for a in numeri_validi:  # A = Imponibile
+            if a >= c:
+                continue
+            b = round(c - a, 2)  # B = IVA teorica
+            if b <= 0:
+                continue
+            
+            # Verifica se B/A corrisponde a un'aliquota reale
+            perc = round((b / a) * 100.0, 1)
+            for aliq in aliquote_valide:
+                if abs(perc - aliq) <= 0.5:
+                    return a, b, c, aliq
 
-    piva_fornitore = piva_trovate[0] if len(piva_trovate) > 0 else ""
-    piva_cliente = piva_trovate[1] if len(piva_trovate) > 1 else ""
+    return None, None, None, 22.0
 
-    cf_fornitore = cf_trovati[0] if len(cf_trovati) > 0 else piva_fornitore
-    cf_cliente = cf_trovati[1] if len(cf_trovati) > 1 else piva_cliente
+def estrai_con_pymupdf(file_bytes: bytes) -> dict:
+    """Esegue il parsing vettoriale ad alta velocità del PDF tramite PyMuPDF."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    testo_completo = ""
+    for page in doc:
+        testo_completo += page.get_text("text") + "\n"
 
-    # 2. Trova Data (formati gg/mm/aaaa o aaaa-mm-gg)
-    date_trovate = re.findall(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', testo_completo)
-    data_doc = "2025-01-01"
-    if date_trovate:
-        g, m, a = date_trovate[0]
-        data_doc = f"{a}-{m.zfill(2)}-{g.zfill(2)}"
+    if len(testo_completo.strip()) < 50:
+        return None  # Documento scansionato, necessita fallback AI
 
-    # 3. Trova Numero Fattura
-    num_match = re.search(r'(?:fattura|doc(?:umento)?)\s*(?:n[°\.]?|numero)?\s*[:\s]*([0-9A-Za-z\-_/]+)', testo_completo, re.IGNORECASE)
-    numero_doc = num_match.group(1) if num_match else "1"
+    # 1. Ricerca Partite IVA (11 cifre) con esclusione da numeri contabili
+    piva_matches = re.findall(r"\b([0-9]{11})\b", testo_completo)
+    piva_uniche = list(dict.fromkeys(piva_matches))
+    cedente_piva = piva_uniche[0] if len(piva_uniche) > 0 else ""
+    cessionario_piva = piva_uniche[1] if len(piva_uniche) > 1 else ""
 
-    # 4. Trova Totale, Imponibile e IVA
-    totale_doc = 0.0
-    tot_match = re.search(r'(?:totale\s*(?:documento|fattura|euro)?|totale)\s*[:\s]*([0-9\.\,]+)', testo_completo, re.IGNORECASE)
-    if tot_match:
-        totale_doc = parse_numero_italiano(tot_match.group(1))
+    # 2. Ricerca Data
+    date_patterns = [
+        r"\b([0-3]?[0-9][/\-.][0-1]?[0-9][/\-.](?:20)?[2-3][0-9])\b",
+        r"\b((?:20)[2-3][0-9][/\-.][0-1]?[0-9][/\-.][0-3]?[0-9])\b"
+    ]
+    data_doc = datetime.today().strftime("%Y-%m-%d")
+    for pat in date_patterns:
+        m = re.search(pat, testo_completo)
+        if m:
+            d_raw = m.group(1).replace("/", "-").replace(".", "-")
+            parti = d_raw.split("-")
+            if len(parti[0]) == 4:
+                data_doc = f"{parti[0]}-{parti[1].zfill(2)}-{parti[2].zfill(2)}"
+            else:
+                anno = parti[2] if len(parti[2]) == 4 else f"20{parti[2]}"
+                data_doc = f"{anno}-{parti[1].zfill(2)}-{parti[0].zfill(2)}"
+            break
 
-    imponibile_doc = 0.0
-    imp_match = re.search(r'(?:imponibile|totale\s*imponibile)\s*[:\s]*([0-9\.\,]+)', testo_completo, re.IGNORECASE)
-    if imp_match:
-        imponibile_doc = parse_numero_italiano(imp_match.group(1))
+    # 3. Ricerca Numero Documento
+    num_match = re.search(r"(?:fattura|fatt\.|doc\.|documento|n°|num\.)\s*(?:n\.?|numero)?\s*[:.\s]?\s*([A-Za-z0-9/\-_]+)", testo_completo, re.IGNORECASE)
+    numero_doc = num_match.group(1).strip() if num_match else "1"
 
-    imposta_doc = 0.0
-    iva_match = re.search(r'(?:imposta|totale\s*iva|iva)\s*[:\s]*([0-9\.\,]+)', testo_completo, re.IGNORECASE)
-    if iva_match:
-        imposta_doc = parse_numero_italiano(iva_match.group(1))
+    # 4. Estrazione Token Numerici escludendo P.IVA (11 cifre) e Anni (4 cifre)
+    tokens = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b", testo_completo)
+    numeri_candidati = []
+    for t in tokens:
+        val = parse_importo(t)
+        # Filtro falsi positivi: escludi anni e interi puri mascherati
+        if val not in [2022.0, 2023.0, 2024.0, 2025.0, 2026.0]:
+            numeri_candidati.append(val)
 
-    # Se manca l'imposta ma abbiamo totale e imponibile, la calcoliamo
-    if totale_doc > 0 and imponibile_doc > 0 and imposta_doc == 0.0:
-        imposta_doc = round(totale_doc - imponibile_doc, 2)
-    elif totale_doc == 0.0 and imponibile_doc > 0 and imposta_doc > 0:
-        totale_doc = round(imponibile_doc + imposta_doc, 2)
+    # 5. Risoluzione Tripletta Matematica (A + B = C)
+    imponibile, imposta, totale, aliquota = trova_tripletta_matematica(numeri_candidati)
 
-    # Deduzione Aliquota IVA (default 22%)
-    aliquota = 22.0
-    if imponibile_doc > 0 and imposta_doc > 0:
-        aliquota_calcolata = round((imposta_doc / imponibile_doc) * 100)
-        if aliquota_calcolata in [4, 5, 10, 22]:
-            aliquota = float(aliquota_calcolata)
+    if totale is None:
+        if numeri_candidati:
+            totale = max(numeri_candidati)
+            imponibile = round(totale / 1.22, 2)
+            imposta = round(totale - imponibile, 2)
+            aliquota = 22.0
+        else:
+            imponibile, imposta, totale, aliquota = 0.0, 0.0, 0.0, 22.0
 
-    # Ragioni sociali (prende le prime righe indicative del documento)
-    ragione_fornitore = linee[0] if len(linee) > 0 else "Fornitore"
-    ragione_cliente = "Cliente Studio"
-    for i, r in enumerate(linee):
-        if any(k in r.lower() for k in ["spett.", "destinatario", "cliente", "cessionario"]):
-            if i + 1 < len(linee):
-                ragione_cliente = linee[i+1]
-                break
+    # Ricerca denominazioni elementari
+    righe = [r.strip() for r in testo_completo.split("\n") if len(r.strip()) > 3]
+    denominazione_cedente = righe[0] if righe else "FORNITORE"
 
     return {
-        "fornitore": {
-            "ragione_sociale": ragione_fornitore[:80],
-            "partita_iva": piva_fornitore,
-            "codice_fiscale": cf_fornitore,
-            "indirizzo": "Via Sede Legale",
-            "cap": "00100",
-            "comune": "Roma",
-            "provincia": "RM"
-        },
-        "cliente": {
-            "ragione_sociale": ragione_cliente[:80],
-            "partita_iva": piva_cliente,
-            "codice_fiscale": cf_cliente,
-            "indirizzo": "Via Cliente",
-            "cap": "00100",
-            "comune": "Roma",
-            "provincia": "RM"
-        },
-        "documento": {
-            "numero": numero_doc,
-            "data": data_doc
-        },
-        "riepilogo_iva": [
-            {
-                "imponibile": imponibile_doc if imponibile_doc > 0 else totale_doc,
-                "aliquota_iva": aliquota,
-                "imposta": imposta_doc
-            }
-        ],
-        "totale_documento": totale_doc
+        "tipo_documento": "TD01",
+        "numero_documento": numero_doc,
+        "data_documento": data_doc,
+        "cedente_denominazione": denominazione_cedente[:80],
+        "cedente_piva": cedente_piva,
+        "cessionario_denominazione": "CLIENTE STUDIO",
+        "cessionario_piva": cessionario_piva,
+        "imponibile": imponibile,
+        "imposta": imposta,
+        "totale_documento": totale,
+        "aliquota_prevalente": aliquota,
+        "riepilogo_iva": [{
+            "aliquota": aliquota,
+            "imponibile": imponibile,
+            "imposta": imposta,
+            "natura": ""
+        }]
     }
 
-def estrai_dati_fattura(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    testo = page.get_text()
+def fallback_gemini(file_bytes: bytes) -> dict:
+    """Fallback con Gemini AI per scansioni raster o immagini pure."""
+    try:
+        import google.generativeai as genai
+        api_key = st.secrets.get("GEMINI_API_KEY", None)
+        if not api_key:
+            return None
 
-    # Se il PDF ha testo leggibile (99% dei casi), estrazione immediata in 0.1 secondi!
-    if len(testo.strip()) > 40:
-        dati = estrazione_locale_istantanea(testo)
-        # Se abbiamo trovato almeno i totali o la partita IVA, restituisci subito
-        if dati["totale_documento"] > 0 or dati["fornitore"]["partita_iva"]:
-            return dati
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        prompt = """
+        Estrai i dati contabili di questa fattura in formato JSON puro conforme a questa struttura:
+        {
+          "tipo_documento": "TD01",
+          "numero_documento": "123",
+          "data_documento": "YYYY-MM-DD",
+          "cedente_denominazione": "",
+          "cedente_piva": "",
+          "cessionario_denominazione": "",
+          "cessionario_piva": "",
+          "totale_documento": 0.0,
+          "riepilogo_iva": [{"aliquota": 22.0, "imponibile": 0.0, "imposta": 0.0, "natura": ""}]
+        }
+        Rispondi ESCLUSIVAMENTE con il blocco JSON valido.
+        """
+        response = model.generate_content(
+            [prompt, {"mime_type": "application/pdf", "data": file_bytes}],
+            request_options={"timeout": 8.0}
+        )
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
+    except Exception:
+        return None
 
-    # Fallback ultra-rapido con IA (solo per scansioni/immagini) con timer di sicurezza
-    if model:
-        try:
-            pix = page.get_pixmap(dpi=80)
-            img_bytes = pix.tobytes("jpeg", jpg_quality=50)
-            
-            prompt = "Estrai dati fattura in JSON: {fornitore:{ragione_sociale,partita_iva,codice_fiscale,indirizzo,cap,comune,provincia}, cliente:{ragione_sociale,partita_iva,codice_fiscale,indirizzo,cap,comune,provincia}, documento:{numero,data}, riepilogo_iva:[{imponibile,aliquota_iva,imposta}], totale_documento}."
-            
-            response = model.generate_content(
-                [prompt, {"mime_type": "image/jpeg", "data": img_bytes}],
-                request_options={"timeout": 8} # Timer rigido: stacca dopo 8 secondi se Google dorme
-            )
-            txt = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(txt)
-        except Exception:
-            pass
-
-    # Se anche l'IA fallisce o va in timeout, restituisce l'analisi locale
-    return estrazione_locale_istantanea(testo)
+def estrai_dati_fattura(file_input, filename="fattura.pdf") -> dict:
+    """
+    Funzione d'ingresso: riceve bytes, oggetti UploadedFile o percorsi file
+    ed esegue la pipeline ibrida con fail-safe garantito.
+    """
+    # No
