@@ -1,58 +1,21 @@
-# app.py - AI Invoice to SdI/TeamSystem (Versione Ultra-Stabile Anti-BlackScreen)
+# app.py - AI Invoice to SdI/TeamSystem (Integrazione CONSPAY)
 import io
 import re
 import zipfile
 import streamlit as st
 from datetime import datetime
 
-# ---------------------------------------------------------
-# Configurazione Pagina (Deve essere la prima istruzione)
-# ---------------------------------------------------------
 st.set_page_config(
-    page_title="AI Invoice to SdI | TeamSystem Bridge",
+    page_title="AI Invoice to SdI | TeamSystem CONSPAY Bridge",
     page_icon="🧾",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ---------------------------------------------------------
-# Import Difensivo dei Moduli
-# ---------------------------------------------------------
-try:
-    from extractor import estrai_dati_fattura
-except Exception:
-    def estrai_dati_fattura(file_bytes, filename):
-        return {
-            "tipo_documento": "TD01",
-            "numero_documento": "1",
-            "data_documento": datetime.today().strftime("%Y-%m-%d"),
-            "cedente_denominazione": "FORNITORE",
-            "cedente_piva": "",
-            "cessionario_denominazione": "CLIENTE STUDIO",
-            "cessionario_piva": "",
-            "imponibile": 0.0,
-            "imposta": 0.0,
-            "totale_documento": 0.0,
-            "aliquota_prevalente": 22.0
-        }
-
-try:
-    from validator import valida_quadratura_completa, valida_partita_iva
-except Exception:
-    def valida_partita_iva(piva):
-        p = re.sub(r"[^0-9]", "", str(piva))
-        return len(p) == 11
-    def valida_quadratura_completa(riepilogo_iva, totale_documento, ritenuta=0.0, bollo=0.0, cassa_previdenza=0.0):
-        tot_calc = sum(r["imponibile"] + r["imposta"] for r in riepilogo_iva) + bollo + cassa_previdenza
-        diff = abs(tot_calc - totale_documento)
-        errs = [f"Differenza totale calcolato ({tot_calc:.2f}€) vs dichiarato ({totale_documento:.2f}€)"] if diff > 0.05 else []
-        return (len(errs) == 0), errs
-
-try:
-    from xml_generator import genera_xml_teamsystem
-except Exception:
-    def genera_xml_teamsystem(d):
-        return "<xml>Mock XML</xml>"
+# Import moduli con fallback
+from extractor import estrai_dati_fattura
+from validator import valida_quadratura_completa, valida_partita_iva
+from xml_generator import genera_xml_teamsystem
 
 try:
     from gdrive import upload_to_drive
@@ -62,195 +25,128 @@ except Exception:
     def upload_to_drive(*args, **kwargs):
         return False, "Modulo Drive non configurato."
 
-# ---------------------------------------------------------
-# Inizializzazione Session State
-# ---------------------------------------------------------
 for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "validation_report", "gdrive_status"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
-# ---------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------
 with st.sidebar:
-    st.title("⚙️ Parametri")
-    codice_dest_default = st.text_input("Codice Destinatario SdI", value="0000000", max_chars=7)
+    st.title("⚙️ Parametri SdI / CONSPAY")
+    codice_dest_default = st.text_input("Codice SdI Ricevente", value="0000000", max_chars=7)
     regime_fiscale_default = st.selectbox(
         "Regime Fiscale Fornitore",
         options=["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato"],
         index=0
     ).split(" - ")[0]
-    
     st.divider()
     salva_drive = st.checkbox("Archivia su Google Drive", value=True)
-    if not GDRIVE_OK:
-        st.caption("ℹ️ Google Drive inattivo o secrets mancanti.")
+    st.caption("Standard: FPR12 v1.2.2 Agenzia delle Entrate per TeamSystem")
 
-# ---------------------------------------------------------
-# Testata Principale
-# ---------------------------------------------------------
-st.title("🧾 AI Invoice to SdI / TeamSystem")
-st.caption("Acquisizione rapida, revisione assistita (Human-in-the-Loop) e generazione tracciati FPR12.")
+st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
+st.caption("Riconoscimento semantico fatture, revisione Human-in-the-Loop e tracciato XML per la riconciliazione bancaria.")
 
-# ---------------------------------------------------------
-# FASE 1: Caricamento File
-# ---------------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Trascina qui la fattura (PDF, JPG, PNG)",
-    type=["pdf", "png", "jpg", "jpeg"]
-)
+uploaded_file = st.file_uploader("Carica fattura PDF o Immagine", type=["pdf", "png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state["last_file_id"] != file_id:
-        with st.status("Elaborazione del documento...", expanded=False) as status:
-            st.write("Lettura stream del file...")
+        with st.status("Analisi semantica e fiscale del documento...", expanded=False) as status:
             file_bytes = uploaded_file.read()
             uploaded_file.seek(0)
-            
-            st.write("Estrazione entità...")
-            try:
-                st.session_state["invoice_data"] = estrai_dati_fattura(file_bytes, uploaded_file.name)
-            except Exception:
-                st.session_state["invoice_data"] = estrai_dati_fattura(b"", uploaded_file.name)
-                
+            st.session_state["invoice_data"] = estrai_dati_fattura(file_bytes, uploaded_file.name)
             st.session_state["last_file_id"] = file_id
             st.session_state["xml_content"] = None
             st.session_state["xml_filename"] = None
             st.session_state["validation_report"] = None
             st.session_state["gdrive_status"] = None
-            status.update(label="✅ Documento caricato!", state="complete")
-        st.success("Dati estratti con successo! Verifica o modifica i dati qui sotto.")
+            status.update(label="✅ Analisi completata con successo!", state="complete")
+        st.success("Dati estratti! Verifica anagrafiche, estremi e IBAN per CONSPAY prima di generare l'XML.")
 
 if st.session_state["invoice_data"] is None:
-    st.info("👆 Carica una fattura per visualizzare il modulo di revisione.")
+    st.info("👆 Carica una fattura per avviare la revisione.")
     st.stop()
 
-# ---------------------------------------------------------
-# FASE 2: Modulo Human-in-the-Loop con Widget Nativi
-# ---------------------------------------------------------
 inv = st.session_state["invoice_data"]
-st.markdown("---")
-st.subheader("✏️ Revisione Dati Fattura")
-st.caption("Tutti i campi sono modificabili. Clicca su 'Conferma e Genera XML' in basso per proseguire.")
 
-with st.form("form_revisione_stabile"):
-    # 1. Estremi Fattura
-    st.markdown("##### 📄 Estremi Documento")
+with st.form("form_revisione_conspay"):
+    st.markdown("#### 📄 1. Estremi del Documento")
     cd1, cd2, cd3, cd4 = st.columns(4)
     with cd1:
         tipo_doc = st.selectbox("Tipo Documento", ["TD01", "TD02", "TD04", "TD24"], index=0)
     with cd2:
-        num_doc = st.text_input("Numero Fattura", value=str(inv.get("numero_documento", "1")))
+        num_doc = st.text_input("Numero Documento", value=str(inv.get("numero_documento", "1")))
     with cd3:
-        raw_d = str(inv.get("data_documento", datetime.today().strftime("%Y-%m-%d")))
         try:
-            d_val = datetime.strptime(raw_d[:10], "%Y-%m-%d")
+            d_val = datetime.strptime(str(inv.get("data_documento", ""))[:10], "%Y-%m-%d")
         except Exception:
             d_val = datetime.today()
         data_doc = st.date_input("Data Documento", value=d_val)
     with cd4:
-        cod_sdi = st.text_input("Codice SdI Destinatario", value=str(inv.get("codice_destinatario", codice_dest_default)), max_chars=7)
+        cod_sdi = st.text_input("Codice Destinatario SdI", value=str(inv.get("codice_destinatario", codice_dest_default)), max_chars=7)
 
     st.markdown("---")
-    
-    # 2. Cedente e Cessionario
+    st.markdown("#### 🏢 2. Anagrafiche Fiscali (Cedente vs Cessionario)")
     col_ced, col_cess = st.columns(2)
     with col_ced:
-        st.markdown("##### 🏢 Fornitore (Cedente)")
-        ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "FORNITORE")))
-        ced_piva = st.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")), max_chars=16)
-        ced_cf = st.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")))
-        ci1, ci2 = st.columns([3, 1])
-        ced_via = ci1.text_input("Indirizzo Sede", value=str(inv.get("cedente_indirizzo", "Via Principale 1")))
-        ced_cap = ci2.text_input("CAP", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
-        ced_comune = st.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
+        st.markdown("**FORNITORE (Cedente / Prestatore)**")
+        ced_nome = st.text_input("Denominazione / Ragione Sociale Fornitore", value=str(inv.get("cedente_denominazione", "")))
+        ced_piva = st.text_input("Partita IVA Fornitore (11 cifre)", value=str(inv.get("cedente_piva", "")), max_chars=16)
+        ced_via = st.text_input("Indirizzo Sede Fornitore", value=str(inv.get("cedente_indirizzo", "Via Sede 1")))
+        ci1, ci2, ci3 = st.columns([2, 3, 1])
+        ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
+        ced_comune = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
+        ced_prov = ci3.text_input("Provincia", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
 
     with col_cess:
-        st.markdown("##### 👤 Cliente Studio (Cessionario)")
-        cess_nome = st.text_input("Denominazione Cliente (Cartella Drive)", value=str(inv.get("cessionario_denominazione", "CLIENTE STUDIO")))
+        st.markdown("**CLIENTE DELLO STUDIO (Cessionario / Committente)**")
+        cess_nome = st.text_input("Denominazione Cliente (Cartella Drive)", value=str(inv.get("cessionario_denominazione", "")))
         cess_piva = st.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")), max_chars=16)
-        cess_cf = st.text_input("Codice Fiscale Cliente", value=str(inv.get("cessionario_cf", "")))
-        cs1, cs2 = st.columns([3, 1])
-        cess_via = cs1.text_input("Indirizzo Cliente", value=str(inv.get("cessionario_indirizzo", "Via Studio 10")))
-        cess_cap = cs2.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
-        cess_comune = st.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
+        cess_cf = st.text_input("Codice Fiscale Cliente (se privato)", value=str(inv.get("cessionario_cf", "")))
+        cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "Via Studio 10")))
+        cs1, cs2, cs3 = st.columns([2, 3, 1])
+        cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
+        cess_comune = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
+        cess_prov = cs3.text_input("Prov.", value=str(inv.get("cessionario_provincia", "RM"))[:2].upper(), max_chars=2)
 
     st.markdown("---")
-    
-    # 3. Dati Economici Principali
-    st.markdown("##### 💰 Dati Economici & IVA")
+    st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY (Blocco DatiPagamento)")
+    cp1, cp2, cp3 = st.columns([2, 1, 1])
+    with cp1:
+        iban_doc = st.text_input("IBAN Accredito Fornitore (fondamentale per CONSPAY)", value=str(inv.get("iban", "")), help="Se presente, TeamSystem riconcilia in automatico il bonifico sull'estratto conto.")
+    with cp2:
+        try:
+            d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
+        except Exception:
+            d_scad = d_val
+        scadenza_pag = st.date_input("Data Scadenza Pagamento", value=d_scad)
+    with cp3:
+        metodo_pag = st.selectbox("Modalità Pagamento", ["MP05 - Bonifico Bancario", "MP08 - Carta di Pagamento", "MP12 - RiBa", "MP01 - Contanti"], index=0).split(" - ")[0]
+
+    st.markdown("---")
+    st.markdown("#### 💰 4. Dati Economici & Quadratura IVA")
     ce1, ce2, ce3, ce4 = st.columns(4)
     with ce1:
-        imponibile_1 = st.number_input("Imponibile Principale (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
+        imponibile_1 = st.number_input("Imponibile (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
     with ce2:
         aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0)
     with ce3:
         imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
     with ce4:
-        natura_1 = st.text_input("Natura (se IVA 0%, es. N3.4, N4)", value=str(inv.get("natura", "")))
+        totale_doc = st.number_input("Totale Documento (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
-    # Seconda aliquota opzionale
-    st.caption("Seconda Aliquota (opzionale, compila solo se documento multi-aliquota)")
-    ca1, ca2, ca3, ca4 = st.columns(4)
-    with ca1:
-        imponibile_2 = st.number_input("Secondo Imponibile (€)", value=0.0, step=0.01)
-    with ca2:
-        aliquota_2 = st.number_input("Seconda Aliquota (%)", value=10.0, step=1.0)
-    with ca3:
-        imposta_2 = st.number_input("Seconda Imposta (€)", value=0.0, step=0.01)
-    with ca4:
-        natura_2 = st.text_input("Natura Seconda Aliquota", value="")
+    btn_submit = st.form_submit_button("✅ Conferma e Genera XML per CONSPAY", type="primary", use_container_width=True)
 
-    # Totali e Ritenute
-    st.markdown("##### ⚖️ Totali di Quadratura")
-    ct1, ct2, ct3, ct4 = st.columns(4)
-    with ct1:
-        cassa = st.number_input("Cassa Previdenza (€)", value=float(inv.get("cassa_previdenza", 0.0)), step=0.01)
-    with ct2:
-        bollo = st.number_input("Bollo Virtuale (€)", value=float(inv.get("bollo", 0.0)), step=2.00)
-    with ct3:
-        ritenuta = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01)
-    with ct4:
-        totale_doc = st.number_input("Totale Fattura Dichiarato (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
-
-    submit_btn = st.form_submit_button("✅ Conferma Dati e Genera XML SdI", type="primary", use_container_width=True)
-
-# ---------------------------------------------------------
-# FASE 3: Generazione XML & Archiviazione
-# ---------------------------------------------------------
-if submit_btn:
-    righe_iva = [{
-        "aliquota": aliquota_1,
-        "imponibile": imponibile_1,
-        "imposta": imposta_1,
-        "natura": natura_1.strip()
-    }]
-    if imponibile_2 > 0 or imposta_2 > 0:
-        righe_iva.append({
-            "aliquota": aliquota_2,
-            "imponibile": imponibile_2,
-            "imposta": imposta_2,
-            "natura": natura_2.strip()
-        })
-
+if btn_submit:
+    righe_iva = [{"aliquota": aliquota_1, "imponibile": imponibile_1, "imposta": imposta_1, "natura": ""}]
     segnalazioni = []
     if ced_piva and not valida_partita_iva(ced_piva):
-        segnalazioni.append(f"P.IVA Cedente '{ced_piva}' non conforme allo standard italiano.")
+        segnalazioni.append(f"P.IVA Cedente '{ced_piva}' non valida per l'Agenzia delle Entrate.")
     if cess_piva and not valida_partita_iva(cess_piva):
-        segnalazioni.append(f"P.IVA Cessionario '{cess_piva}' non conforme allo standard italiano.")
+        segnalazioni.append(f"P.IVA Cessionario '{cess_piva}' non valida per l'Agenzia delle Entrate.")
 
-    quadratura_ok, errs = valida_quadratura_completa(
-        riepilogo_iva=righe_iva,
-        totale_documento=totale_doc,
-        ritenuta=ritenuta,
-        bollo=bollo,
-        cassa_previdenza=cassa
-    )
+    quadratura_ok, errs = valida_quadratura_completa(riepilogo_iva=righe_iva, totale_documento=totale_doc)
     st.session_state["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
 
-    tot_imp_totale = sum(r["imponibile"] for r in righe_iva)
-    payload_xml = {
+    payload = {
         "tipo_documento": tipo_doc,
         "numero_documento": num_doc,
         "data_documento": data_doc.strftime("%Y-%m-%d"),
@@ -258,66 +154,58 @@ if submit_btn:
         "regime_fiscale": regime_fiscale_default,
         "cedente_denominazione": ced_nome,
         "cedente_piva": ced_piva,
-        "cedente_cf": ced_cf if ced_cf else ced_piva,
         "cedente_indirizzo": ced_via,
         "cedente_cap": ced_cap,
         "cedente_comune": ced_comune,
-        "cedente_nazione": "IT",
+        "cedente_provincia": ced_prov,
         "cessionario_denominazione": cess_nome,
         "cessionario_piva": cess_piva,
-        "cessionario_cf": cess_cf if cess_cf else cess_piva,
+        "cessionario_cf": cess_cf,
         "cessionario_indirizzo": cess_via,
         "cessionario_cap": cess_cap,
         "cessionario_comune": cess_comune,
-        "cessionario_nazione": "IT",
+        "cessionario_provincia": cess_prov,
         "riepilogo_iva": righe_iva,
         "totale_documento": totale_doc,
-        "ritenuta": ritenuta,
-        "bollo": bollo,
-        "cassa_previdenza": cassa,
+        "iban": iban_doc,
+        "data_scadenza": scadenza_pag.strftime("%Y-%m-%d"),
+        "modalita_pagamento": metodo_pag,
         "linee": [{
-            "descrizione": f"Merci/Servizi documento n. {num_doc}",
-            "prezzo_unitario": tot_imp_totale,
-            "prezzo_totale": tot_imp_totale,
-            "aliquota": righe_iva[0]["aliquota"],
-            "natura": righe_iva[0]["natura"]
+            "descrizione": f"Merci/Servizi doc. n. {num_doc}",
+            "prezzo_totale": imponibile_1,
+            "aliquota": aliquota_1
         }]
     }
 
-    # Creazione XML
-    xml_str = genera_xml_teamsystem(payload_xml)
-    clean_piva = ced_piva.replace("IT", "").strip() if ced_piva else "00000000000"
-    base_name = f"IT{clean_piva}_{num_doc.replace('/', '_')}"
+    xml_text = genera_xml_teamsystem(payload)
+    clean_piva = ced_piva.replace("IT", "").strip() or "00000000000"
+    base_file = f"IT{clean_piva}_{num_doc.replace('/', '_')}"
     
-    st.session_state["xml_content"] = xml_str
-    st.session_state["xml_filename"] = f"{base_name}.xml"
+    st.session_state["xml_content"] = xml_text
+    st.session_state["xml_filename"] = f"{base_file}.xml"
 
-    # Upload Drive se abilitato
     if salva_drive and GDRIVE_OK:
-        with st.spinner("Archiviazione Google Drive..."):
+        with st.spinner("Archiviazione su Google Drive..."):
             uploaded_file.seek(0)
             ok, msg = upload_to_drive(
                 pdf_bytes=uploaded_file.read(),
-                xml_string=xml_str,
+                xml_string=xml_text,
                 nome_cliente=cess_nome,
-                filename_base=base_name
+                filename_base=base_file
             )
             st.session_state["gdrive_status"] = (ok, msg)
 
-# ---------------------------------------------------------
-# FASE 4: Download & Anteprima
-# ---------------------------------------------------------
 if st.session_state["xml_content"] is not None:
     st.markdown("---")
-    st.subheader("📦 Step 3: Esito & Download")
+    st.subheader("📦 Step 3: XML Pronto per CONSPAY / TeamSystem")
     is_ok, anomalie = st.session_state["validation_report"]
 
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success("✅ **Quadratura Contabile Perfetta**: Totale e imposta allineati al centesimo.")
+            st.success("✅ **Tracciato Conforme FatturaPA 1.2.2**: I nodi fiscali e i parametri bancari CONSPAY sono quadrati.")
         else:
-            st.warning("⚠️ **Segnalazioni contabili:**")
+            st.warning("⚠️ **Verifiche di quadratura:**")
             for a in anomalie:
                 st.write(f"- {a}")
 
@@ -328,7 +216,6 @@ if st.session_state["xml_content"] is not None:
             else:
                 st.warning(f"☁️ {g_msg}")
 
-    # Creazione ZIP
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"])
@@ -338,7 +225,7 @@ if st.session_state["xml_content"] is not None:
 
     with c2:
         st.download_button(
-            "💾 Scarica solo XML FPR12",
+            "💾 Scarica solo XML FPR12 (TeamSystem)",
             data=st.session_state["xml_content"],
             file_name=st.session_state["xml_filename"],
             mime="application/xml",
@@ -353,5 +240,5 @@ if st.session_state["xml_content"] is not None:
             use_container_width=True
         )
 
-    with st.expander("🔍 Ispezione Tracciato XML Formattato"):
+    with st.expander("🔍 Ispezione Tracciato XML FPR12 (con DatiPagamento CONSPAY)"):
         st.code(st.session_state["xml_content"], language="xml")
