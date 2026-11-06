@@ -27,8 +27,14 @@ def valida_quadratura(riepilogo, totale, ritenuta=0.0):
     errs = [f"Differenza totale calcolato ({tot_calc:.2f}€ lordo / {tot_calc - ritenuta:.2f}€ netto) vs dichiarato ({totale:.2f}€)"] if diff > 0.05 else []
     return (len(errs) == 0), errs
 
-from extractor import estrai_dati_fattura
-from xml_generator import genera_xml_teamsystem
+try:
+    from extractor import estrai_dati_fattura
+except SyntaxError as e:
+    st.error(f"❌ Errore di sintassi in extractor.py alla riga {e.lineno}: {e.text}")
+    st.stop()
+except BaseException as e:
+    st.error(f"❌ Errore durante il caricamento di extractor.py: {e}")
+    st.stop()
 
 try:
     from gdrive import upload_to_drive
