@@ -1,6 +1,5 @@
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Versione Auto-Consistente)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY
 import io
-import re
 import zipfile
 import pandas as pd
 import streamlit as st
@@ -13,188 +12,113 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ---------------------------------------------------------
-# FUNZIONI DI VALIDAZIONE INTEGRATE (Anti-ImportError)
-# ---------------------------------------------------------
-def valida_partita_iva_internazionale(piva: str, paese: str = "IT") -> bool:
-    """Verifica P.IVA italiane (formula di Luhn) o comunitarie UE (VIES)."""
-    piva = re.sub(r"[^A-Za-z0-9]", "", str(piva)).upper()
-    paese = str(paese).strip().upper() if paese else "IT"
-    if not piva:
-        return False
+# Funzioni di validazione integrate
+def valida_partita_iva(piva: str, paese: str = "IT") -> bool:
+    p = str(piva).strip().upper()
     if paese == "IT":
-        if len(piva) != 11 or not piva.isdigit():
-            return False
-        s = 0
-        for i in range(10):
-            c = int(piva[i])
-            if i % 2 == 1:
-                c *= 2
-                if c > 9:
-                    c -= 9
-            s += c
-        controllo = (10 - (s % 10)) % 10
-        return controllo == int(piva[10])
-    # Fornitori esteri UE (Francia, Germania, ecc.)
-    return 4 <= len(piva) <= 15
+        if len(p) != 11 or not p.isdigit(): return False
+        s = sum(int(p[i]) if i % 2 == 0 else ((int(p[i]) * 2) - 9 if int(p[i]) * 2 > 9 else int(p[i]) * 2) for i in range(10))
+        return ((10 - (s % 10)) % 10) == int(p[10])
+    return 4 <= len(p) <= 15
 
-def valida_quadratura_locale(riepilogo_iva, totale_documento, ritenuta=0.0, bollo=0.0, cassa_previdenza=0.0):
-    """Verifica di quadratura contabile con supporto alle operazioni N3.2."""
-    errori = []
-    totale_imponibile = 0.0
-    totale_imposta = 0.0
+def valida_quadratura(riepilogo, totale):
+    tot_calc = sum(r["imponibile"] + r["imposta"] for r in riepilogo)
+    diff = abs(tot_calc - totale)
+    errs = [f"Differenza totale calcolato ({tot_calc:.2f}€) vs dichiarato ({totale:.2f}€)"] if diff > 0.05 else []
+    return (len(errs) == 0), errs
 
-    for idx, rigo in enumerate(riepilogo_iva, start=1):
-        imp = round(float(rigo.get("imponibile", 0.0)), 2)
-        aliq = float(rigo.get("aliquota", 0.0))
-        iva = round(float(rigo.get("imposta", 0.0)), 2)
-        nat = str(rigo.get("natura", "")).strip().upper()
-
-        if aliq == 0.0:
-            if not nat:
-                errori.append(f"Rigo {idx}: Aliquota 0% priva di Natura IVA obbligatoria (es. N3.2 per Fornitori UE).")
-            if iva != 0.0:
-                errori.append(f"Rigo {idx}: Con Natura {nat} l'imposta IVA deve essere 0.00€.")
-        else:
-            iva_calc = round((imp * aliq) / 100.0, 2)
-            if abs(iva_calc - iva) > 0.02:
-                errori.append(f"Rigo {idx}: IVA al {aliq}% non allineata: calcolata {iva_calc}€ vs {iva}€.")
-
-        totale_imponibile += imp
-        totale_imposta += iva
-
-    totale_teorico = round(totale_imponibile + totale_imposta + cassa_previdenza + bollo, 2)
-    diff = min(abs(totale_teorico - totale_documento), abs((totale_teorico - ritenuta) - totale_documento))
-    if diff > 0.05:
-        errori.append(f"Quadratura fallita: Totale calcolato ({totale_teorico:.2f}€) vs Dichiarato ({totale_documento:.2f}€).")
-
-    return (len(errori) == 0), errori
-
-# ---------------------------------------------------------
-# IMPORT PROTETTO MODULI SECONDARI
-# ---------------------------------------------------------
-try:
-    from extractor import estrai_dati_fattura
-except BaseException as e:
-    st.error(f"Errore in extractor.py: {e}")
-    st.stop()
-
-try:
-    from xml_generator import genera_xml_teamsystem
-except BaseException as e:
-    st.error(f"Errore in xml_generator.py: {e}")
-    st.stop()
+# Import moduli secondari
+from extractor import estrai_dati_fattura
+from xml_generator import genera_xml_teamsystem
 
 try:
     from gdrive import upload_to_drive
     GDRIVE_OK = True
 except Exception:
     GDRIVE_OK = False
-    def upload_to_drive(*args, **kwargs):
-        return False, "Modulo Drive non attivo."
+    def upload_to_drive(*args, **kwargs): return False, "Drive non attivo"
 
-# Inizializzazione Session State
-for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "validation_report", "gdrive_status", "motore_usato", "testo_grezzo"]:
+# Session State
+for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "validation_report", "gdrive_status", "motore_usato", "testo_grezzo", "errore_ai"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
 # Sidebar
 with st.sidebar:
-    st.title("⚙️ Motore & Regime")
+    st.title("⚙️ Configurazione")
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
     api_key_input = st.text_input("Google Gemini API Key", value=secret_key, type="password")
     if api_key_input and len(api_key_input.strip()) > 10:
-        st.success("🟢 IA Gemini Attiva (Supporto Fornitori UE)")
+        st.success("🟢 Chiave IA Registrata")
     else:
-        st.warning("🟡 Modalità Locale (Solo Regex)")
+        st.info("ℹ️ Inserisci la chiave per il motore AI o usa il parser locale")
 
     st.divider()
-    codice_dest_default = st.text_input("Codice SdI Destinatario", value="0000000", max_chars=7)
-    regime_fiscale_default = st.selectbox(
-        "Regime Fiscale Fornitore",
-        options=["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato"],
-        index=0
-    ).split(" - ")[0]
+    codice_dest_default = st.text_input("Codice SdI Ricevente", value="0000000", max_chars=7)
     salva_drive = st.checkbox("Archivia su Google Drive", value=True)
 
-# Testata
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Fatturazione FPR12 v1.2.2 - Gestione Rigida Cedente (Fornitori Esteri/Nazionali) vs Cessionario (Cliente Studio).")
+st.caption("Fatturazione FPR12 v1.2.2 - Estrazione garantita Cedente, Cessionario, Dati Bancari e Riconciliazione.")
 
-# Upload
 uploaded_file = st.file_uploader("Carica fattura (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state["last_file_id"] != file_id:
-        with st.status("Analisi e separazione dei ruoli anagrafici...", expanded=True) as status:
+        with st.status("Elaborazione del documento in corso...", expanded=True) as status:
             file_bytes = uploaded_file.read()
             uploaded_file.seek(0)
-            dati, motore, testo_raw = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
+            dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
+            
             st.session_state["invoice_data"] = dati
             st.session_state["motore_usato"] = motore
             st.session_state["testo_grezzo"] = testo_raw
+            st.session_state["errore_ai"] = err_ai
             st.session_state["last_file_id"] = file_id
             st.session_state["xml_content"] = None
             st.session_state["xml_filename"] = None
             st.session_state["validation_report"] = None
-            status.update(label=f"✅ Analisi completata con: {motore}", state="complete", expanded=False)
+            status.update(label=f"✅ Analisi completata: {motore}", state="complete", expanded=False)
 
 if st.session_state["invoice_data"] is None:
-    st.info("👆 Carica una fattura per visualizzare i soggetti contabili.")
+    st.info("👆 Carica una fattura per iniziare.")
     st.stop()
 
 inv = st.session_state["invoice_data"]
 
-# ---------------------------------------------------------
-# CONTROLLO VISIVO RAPIDO CON st.data_editor E SWAP
-# ---------------------------------------------------------
-st.markdown("### 🔍 Verifica Rapida Soggetti Estratti (Human-in-the-Loop)")
+if st.session_state.get("errore_ai"):
+    st.warning(f"⚠️ Avviso Motore AI: {st.session_state['errore_ai']} (I dati sono stati estratti tramite il parser locale).")
 
-df_confronto = pd.DataFrame([
+# Tabella di controllo rapido
+st.markdown("### 🔍 Verifica Soggetti Estratti (Human-in-the-Loop)")
+df_rep = pd.DataFrame([
     {
-        "Ruolo": "🏢 FORNITORE (Cedente / Emittente)",
+        "Ruolo": "🏢 FORNITORE (Cedente/Emittente)",
         "Denominazione": inv.get("cedente_denominazione", ""),
-        "Paese": inv.get("cedente_paese", "IT"),
-        "P.IVA / Identificativo": inv.get("cedente_piva", ""),
-        "Comune / Sede": f"{inv.get('cedente_comune', '')} ({inv.get('cedente_nazione', '')})"
+        "P.IVA": inv.get("cedente_piva", ""),
+        "Indirizzo Sede": f"{inv.get('cedente_indirizzo', '')}, {inv.get('cedente_cap', '')} {inv.get('cedente_comune', '')} ({inv.get('cedente_provincia', '')})"
     },
     {
-        "Ruolo": "👤 CLIENTE STUDIO (Cessionario / Ricevente)",
+        "Ruolo": "👤 CLIENTE STUDIO (Cessionario/Ricevente)",
         "Denominazione": inv.get("cessionario_denominazione", ""),
-        "Paese": inv.get("cessionario_paese", "IT"),
-        "P.IVA / Identificativo": inv.get("cessionario_piva", "") or inv.get("cessionario_cf", ""),
-        "Comune / Sede": f"{inv.get('cessionario_comune', '')} ({inv.get('cessionario_nazione', '')})"
+        "P.IVA": inv.get("cessionario_piva", "") or inv.get("cessionario_cf", ""),
+        "Indirizzo Sede": f"{inv.get('cessionario_indirizzo', '')}, {inv.get('cessionario_cap', '')} {inv.get('cessionario_comune', '')} ({inv.get('cessionario_provincia', '')})"
     }
 ])
+st.data_editor(df_rep, use_container_width=True, disabled=True)
 
-st.data_editor(df_confronto, use_container_width=True, disabled=True)
-
-# Pulsante di swap per inversione istantanea con 1 clic
-col_inv1, col_inv2 = st.columns([1, 4])
-with col_inv1:
-    if st.button("🔄 Inverti Fornitore e Cliente", help="Clicca qui se l'OCR ha scambiato chi emette e chi riceve la fattura"):
-        c_nome, c_paese, c_piva, c_ind, c_cap, c_com, c_prov = (
-            inv["cedente_denominazione"], inv.get("cedente_paese", "IT"), inv["cedente_piva"],
-            inv.get("cedente_indirizzo", ""), inv.get("cedente_cap", ""), inv.get("cedente_comune", ""), inv.get("cedente_provincia", "")
-        )
-        inv["cedente_denominazione"], inv["cedente_paese"], inv["cedente_piva"], inv["cedente_indirizzo"], inv["cedente_cap"], inv["cedente_comune"], inv["cedente_provincia"] = (
-            inv["cessionario_denominazione"], inv.get("cessionario_paese", "IT"), inv["cessionario_piva"],
-            inv.get("cessionario_indirizzo", ""), inv.get("cessionario_cap", ""), inv.get("cessionario_comune", ""), inv.get("cessionario_provincia", "")
-        )
-        inv["cessionario_denominazione"], inv["cessionario_paese"], inv["cessionario_piva"], inv["cessionario_indirizzo"], inv["cessionario_cap"], inv["cessionario_comune"], inv["cessionario_provincia"] = (
-            c_nome, c_paese, c_piva, c_ind, c_cap, c_com, c_prov
-        )
-        st.session_state["invoice_data"] = inv
-        st.rerun()
+# Inversione manuale di sicurezza
+if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)"):
+    for campo in ["denominazione", "paese", "piva", "indirizzo", "cap", "comune", "provincia"]:
+        inv[f"cedente_{campo}"], inv[f"cessionario_{campo}"] = inv.get(f"cessionario_{campo}", ""), inv.get(f"cedente_{campo}", "")
+    st.session_state["invoice_data"] = inv
+    st.rerun()
 
 st.markdown("---")
 
-# ---------------------------------------------------------
-# FORM DI DETTAGLIO EDITABILE
-# ---------------------------------------------------------
-with st.form("form_revisione_rigida"):
-    st.markdown("#### 📄 1. Estremi Fattura & Codice SdI Destinatario")
+# Form Revisione Dati
+with st.form("form_revisione_totale"):
+    st.markdown("#### 📄 1. Estremi del Documento")
     cd1, cd2, cd3, cd4 = st.columns(4)
     with cd1:
         tipo_doc = st.selectbox("Tipo Documento", ["TD01", "TD02", "TD04", "TD24"], index=0)
@@ -210,47 +134,39 @@ with st.form("form_revisione_rigida"):
         cod_sdi = st.text_input("Codice Destinatario SdI", value=str(inv.get("codice_destinatario", codice_dest_default)), max_chars=7)
 
     st.markdown("---")
-    st.markdown("#### 🏢 2. Anagrafiche Segregate (Fornitore Emittente vs Cliente Studio)")
+    st.markdown("#### 🏢 2. Anagrafiche Fiscali Segregate")
     col_ced, col_cess = st.columns(2)
     
     with col_ced:
-        st.markdown("**FORNITORE (Cedente/Prestatore - Chi emette)**")
-        ced_nome = st.text_input("Denominazione Fornitore (es. SGB/CGI Finance)", value=str(inv.get("cedente_denominazione", "")))
-        
+        st.markdown("**FORNITORE (Cedente / Prestatore - Chi emette)**")
+        ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "")))
         c_p1, c_p2 = st.columns([1, 3])
-        with c_p1:
-            ced_paese = st.text_input("Paese", value=str(inv.get("cedente_paese", "IT"))[:2].upper(), max_chars=2, help="Es. FR per Francia, IT per Italia")
-        with c_p2:
-            ced_piva = st.text_input("Partita IVA Fornitore (senza prefisso paese)", value=str(inv.get("cedente_piva", "")))
-            
-        ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "Via Sede 1")))
+        ced_paese = c_p1.text_input("Paese Fornitore", value=str(inv.get("cedente_paese", "IT"))[:2].upper(), max_chars=2)
+        ced_piva = c_p2.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")))
+        ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")))
         ci1, ci2, ci3 = st.columns([2, 3, 1])
         ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
-        ced_comune = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
-        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", ""))[:2].upper(), max_chars=2, help="Lasciare vuoto se fornitore estero (non IT)")
+        ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
+        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
 
     with col_cess:
-        st.markdown("**CLIENTE STUDIO (Cessionario/Committente - Chi riceve)**")
-        cess_nome = st.text_input("Denominazione Cliente Studio", value=str(inv.get("cessionario_denominazione", "")))
-        
+        st.markdown("**CLIENTE STUDIO (Cessionario / Committente - Chi riceve)**")
+        cess_nome = st.text_input("Denominazione Cliente", value=str(inv.get("cessionario_denominazione", "")))
         cs_p1, cs_p2 = st.columns([1, 3])
-        with cs_p1:
-            cess_paese = st.text_input("Paese Cliente", value=str(inv.get("cessionario_paese", "IT"))[:2].upper(), max_chars=2)
-        with cs_p2:
-            cess_piva = st.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
-            
+        cess_paese = cs_p1.text_input("Paese Cliente", value=str(inv.get("cessionario_paese", "IT"))[:2].upper(), max_chars=2)
+        cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
         cess_cf = st.text_input("Codice Fiscale Cliente (se privato)", value=str(inv.get("cessionario_cf", "")))
-        cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "Via Studio 10")))
+        cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "")))
         cs1, cs2, cs3 = st.columns([2, 3, 1])
         cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
-        cess_comune = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
+        cess_com = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
         cess_prov = cs3.text_input("Prov. Cliente", value=str(inv.get("cessionario_provincia", "RM"))[:2].upper(), max_chars=2)
 
     st.markdown("---")
-    st.markdown("#### 🏦 3. Dati Riconciliazione Bancaria CONSPAY")
+    st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY")
     cp1, cp2, cp3 = st.columns([2, 1, 1])
     with cp1:
-        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Mappato nel nodo 2.4 DatiPagamento per l'estratto conto CONSPAY.")
+        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Se vuoto, la riconciliazione su CONSPAY avverrà tramite numero fattura e importo.")
     with cp2:
         try:
             d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
@@ -258,44 +174,36 @@ with st.form("form_revisione_rigida"):
             d_scad = d_val
         scadenza_pag = st.date_input("Scadenza Pagamento", value=d_scad)
     with cp3:
-        metodo_pag = st.selectbox("Metodo Pagamento", ["MP05 - Bonifico Bancario", "MP08 - Carta", "MP12 - RiBa", "MP01 - Contanti"], index=0).split(" - ")[0]
+        metodo_default = inv.get("modalita_pagamento", "MP05")
+        metodi_list = ["MP05 - Bonifico Bancario", "MP08 - Carta di Pagamento", "MP12 - RiBa", "MP01 - Contanti"]
+        idx_met = 1 if metodo_default == "MP08" else 0
+        metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met).split(" - ")[0]
 
     st.markdown("---")
-    st.markdown("#### 💰 4. Sezione Contabile & Natura IVA (N3.2 per Fornitori Esteri UE)")
+    st.markdown("#### 💰 4. Sezione Contabile & Quadratura IVA")
     ce1, ce2, ce3, ce4 = st.columns(4)
     with ce1:
         imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
     with ce2:
-        default_aliq = 0.0 if ced_paese != "IT" else float(inv.get("aliquota_prevalente", 22.0))
-        aliquota_1 = st.number_input("Aliquota IVA (%)", value=default_aliq, step=1.0)
+        aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0)
     with ce3:
-        default_natura = "N3.2" if (ced_paese != "IT" or aliquota_1 == 0.0) else str(inv.get("natura", ""))
-        natura_iva = st.text_input("Natura IVA (N3.2 obbligatoria per UE)", value=default_natura)
+        natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per UE)", value=str(inv.get("natura", "")))
     with ce4:
-        imposta_1 = st.number_input("Imposta IVA (€)", value=0.0 if aliquota_1 == 0.0 else float(inv.get("imposta", 0.0)), step=0.01)
+        imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
 
-    totale_doc = st.number_input("Totale Documento Fattura (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
+    totale_doc = st.number_input("Totale Documento (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
     btn_submit = st.form_submit_button("✅ Conferma Dati e Genera XML FPR12 per CONSPAY", type="primary", use_container_width=True)
 
-# ---------------------------------------------------------
-# GENERAZIONE E DOWNLOAD
-# ---------------------------------------------------------
 if btn_submit:
-    righe_iva = [{
-        "aliquota": aliquota_1, 
-        "imponibile": imponibile_1, 
-        "imposta": imposta_1, 
-        "natura": natura_iva.strip().upper()
-    }]
-    
+    righe_iva = [{"aliquota": aliquota_1, "imponibile": imponibile_1, "imposta": imposta_1, "natura": natura_iva.strip().upper()}]
     segnalazioni = []
-    if ced_piva and not valida_partita_iva_internazionale(ced_piva, ced_paese):
-        segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non conforme allo standard del paese.")
-    if cess_piva and not valida_partita_iva_internazionale(cess_piva, cess_paese):
-        segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non conforme all'algoritmo di controllo.")
+    if ced_piva and not valida_partita_iva(ced_piva, ced_paese):
+        segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non valida.")
+    if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
+        segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
 
-    quadratura_ok, errs = valida_quadratura_locale(riepilogo_iva=righe_iva, totale_documento=totale_doc)
+    quadratura_ok, errs = valida_quadratura(righe_iva, totale_doc)
     st.session_state["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
 
     payload = {
@@ -303,13 +211,13 @@ if btn_submit:
         "numero_documento": num_doc,
         "data_documento": data_doc.strftime("%Y-%m-%d"),
         "codice_destinatario": cod_sdi,
-        "regime_fiscale": regime_fiscale_default,
+        "regime_fiscale": "RF01",
         "cedente_denominazione": ced_nome,
         "cedente_paese": ced_paese,
         "cedente_piva": ced_piva,
         "cedente_indirizzo": ced_via,
         "cedente_cap": ced_cap,
-        "cedente_comune": ced_comune,
+        "cedente_comune": ced_com,
         "cedente_provincia": ced_prov if ced_paese == "IT" else "",
         "cessionario_denominazione": cess_nome,
         "cessionario_paese": cess_paese,
@@ -317,7 +225,7 @@ if btn_submit:
         "cessionario_cf": cess_cf,
         "cessionario_indirizzo": cess_via,
         "cessionario_cap": cess_cap,
-        "cessionario_comune": cess_comune,
+        "cessionario_comune": cess_com,
         "cessionario_provincia": cess_prov,
         "riepilogo_iva": righe_iva,
         "totale_documento": totale_doc,
@@ -338,14 +246,9 @@ if btn_submit:
     st.session_state["xml_filename"] = f"{base_file}.xml"
 
     if salva_drive and GDRIVE_OK:
-        with st.spinner("Archiviazione su Google Drive in corso..."):
+        with st.spinner("Archiviazione Google Drive..."):
             uploaded_file.seek(0)
-            ok, msg = upload_to_drive(
-                pdf_bytes=uploaded_file.read(),
-                xml_string=xml_text,
-                nome_cliente=cess_nome,
-                filename_base=base_file
-            )
+            ok, msg = upload_to_drive(uploaded_file.read(), xml_text, cess_nome, base_file)
             st.session_state["gdrive_status"] = (ok, msg)
 
 if st.session_state["xml_content"] is not None:
@@ -356,9 +259,9 @@ if st.session_state["xml_content"] is not None:
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success("✅ **Tracciato Conforme FPR12**: Ruoli segregati correttamente, nodi CONSPAY e Natura N3.2 validati.")
+            st.success("✅ **Quadratura e Dati Fiscali Validi**: Documento pronto per l'importazione.")
         else:
-            st.warning("⚠️ **Verifiche di quadratura:**")
+            st.warning("⚠️ **Segnalazioni contabili:**")
             for a in anomalie:
                 st.write(f"- {a}")
 
@@ -387,11 +290,4 @@ if st.session_state["xml_content"] is not None:
         st.download_button(
             "🗂️ Scarica Pacchetto ZIP (PDF + XML)",
             data=zip_bytes,
-            file_name=f"Fattura_{st.session_state['xml_filename'].replace('.xml', '')}.zip",
-            mime="application/zip",
-            type="primary",
-            use_container_width=True
-        )
-
-    with st.expander("🔍 Ispezione Tracciato XML FPR12"):
-        st.code(st.session_state["xml_content"], language="xml")
+            file_name=f"Fattur
