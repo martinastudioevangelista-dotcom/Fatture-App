@@ -1,4 +1,4 @@
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Supporto Ritenute & Multiformato)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Conforme Agenzia Entrate & ECONS)
 import io
 import zipfile
 import pandas as pd
@@ -15,8 +15,7 @@ st.set_page_config(
 def valida_partita_iva(piva: str, paese: str = "IT") -> bool:
     p = str(piva).strip().upper()
     if paese == "IT":
-        if len(p) != 11 or not p.isdigit():
-            return False
+        if len(p) != 11 or not p.isdigit(): return False
         s = sum(int(p[i]) if i % 2 == 0 else ((int(p[i]) * 2) - 9 if int(p[i]) * 2 > 9 else int(p[i]) * 2) for i in range(10))
         return ((10 - (s % 10)) % 10) == int(p[10])
     return 4 <= len(p) <= 15
@@ -30,11 +29,13 @@ def valida_quadratura(riepilogo, totale, ritenuta=0.0):
 try:
     from extractor import estrai_dati_fattura
 except SyntaxError as e:
-    st.error(f"❌ Errore di sintassi in extractor.py alla riga {e.lineno}: {e.text}")
+    st.error(f"❌ Errore sintassi in extractor.py (riga {e.lineno}): {e.text}")
     st.stop()
 except BaseException as e:
-    st.error(f"❌ Errore durante il caricamento di extractor.py: {e}")
+    st.error(f"❌ Errore in extractor.py: {e}")
     st.stop()
+
+from xml_generator import genera_xml_teamsystem
 
 try:
     from gdrive import upload_to_drive
@@ -48,27 +49,33 @@ for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "valida
         st.session_state[k] = None
 
 with st.sidebar:
-    st.title("⚙️ Configurazione")
+    st.title("⚙️ Impostazioni")
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
     api_key_input = st.text_input("Google Gemini API Key", value=secret_key, type="password")
     if api_key_input and len(api_key_input.strip()) > 10:
-        st.success("🟢 Chiave IA Registrata")
+        st.success("🟢 Chiave IA Attiva")
     else:
-        st.info("ℹ️ Inserisci la chiave per attivare l'estrazione visiva Gemini")
+        st.info("ℹ️ Chiave opzionale (Parser Locale Attivo)")
 
     st.divider()
-    codice_dest_default = st.text_input("Codice SdI Ricevente", value="0000000", max_chars=7)
+    codice_dest_default = st.text_input("Codice SdI Destinatario", value="0000000", max_chars=7)
     salva_drive = st.checkbox("Archivia su Google Drive", value=True)
 
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Fatturazione FPR12 v1.2.2 - Gestione automatica fatture commerciali, proforma con ritenuta d'acconto e fatture attive.")
+st.caption("Fatturazione FPR12 v1.2.2 - Supporto fatture passive (TD01), autofatture estere (TD17) e notule con ritenuta.")
 
-uploaded_file = st.file_uploader("Carica fattura (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
+col_up1, col_up2 = st.columns([4, 1])
+with col_up1:
+    uploaded_file = st.file_uploader("Carica fattura (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
+with col_up2:
+    st.write("")
+    st.write("")
+    force_reparse = st.button("🔄 Rianalizza Documento", help="Forza una nuova lettura completa del file.")
 
 if uploaded_file is not None:
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
-    if st.session_state["last_file_id"] != file_id:
-        with st.status("Elaborazione e quadratura contabile...", expanded=True) as status:
+    if st.session_state["last_file_id"] != file_id or force_reparse:
+        with st.status("Elaborazione multi-pagina e quadratura contabile...", expanded=True) as status:
             file_bytes = uploaded_file.read()
             uploaded_file.seek(0)
             dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
@@ -82,6 +89,7 @@ if uploaded_file is not None:
             st.session_state["xml_filename"] = None
             st.session_state["validation_report"] = None
             status.update(label=f"✅ Analisi completata: {motore}", state="complete", expanded=False)
+        st.rerun()
 
 if st.session_state["invoice_data"] is None:
     st.info("👆 Carica una fattura per iniziare.")
@@ -90,7 +98,7 @@ if st.session_state["invoice_data"] is None:
 inv = st.session_state["invoice_data"]
 
 if st.session_state.get("errore_ai"):
-    st.warning(f"⚠️ Avviso Motore AI: {st.session_state['errore_ai']} (Elaborazione eseguita con il parser locale).")
+    st.warning(f"⚠️ Avviso Motore AI: {st.session_state['errore_ai']}")
 
 st.markdown("### 🔍 Verifica Soggetti Estratti (Human-in-the-Loop)")
 df_rep = pd.DataFrame([
@@ -118,10 +126,15 @@ if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)"):
 st.markdown("---")
 
 with st.form("form_revisione_totale"):
-    st.markdown("#### 📄 1. Estremi del Documento")
+    st.markdown("#### 📄 1. Estremi del Documento & Tipo Tracciato")
     cd1, cd2, cd3, cd4 = st.columns(4)
     with cd1:
-        tipo_doc = st.selectbox("Tipo Documento", ["TD01", "TD02", "TD04", "TD24"], index=0)
+        tipo_doc_default = "TD17" if inv.get("cedente_paese") != "IT" and inv.get("tipo_documento") == "TD17" else inv.get("tipo_documento", "TD01")
+        tipo_doc = st.selectbox(
+            "Tipo Documento",
+            ["TD01 - Fattura Ordinaria (TeamSystem)", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"],
+            index=1 if tipo_doc_default == "TD17" else 0
+        ).split(" - ")[0]
     with cd2:
         num_doc = st.text_input("Numero Documento", value=str(inv.get("numero_documento", "1")))
     with cd3:
@@ -148,7 +161,7 @@ with st.form("form_revisione_totale"):
         ci1, ci2, ci3 = st.columns([2, 3, 1])
         ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
         ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
-        ced_prov = ci3.text_input("Prov. Fornitore", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
+        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2, help="Lasciare vuoto per fornitori esteri")
 
     with col_cess:
         st.markdown("**CLIENTE STUDIO (Cessionario / Committente - Chi riceve)**")
@@ -167,7 +180,7 @@ with st.form("form_revisione_totale"):
     st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY")
     cp1, cp2, cp3 = st.columns([2, 1, 1])
     with cp1:
-        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Se presente, permette l'aggancio automatico in TeamSystem CONSPAY.")
+        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Mappato nel blocco DatiPagamento per CONSPAY.")
     with cp2:
         try:
             d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
@@ -181,24 +194,25 @@ with st.form("form_revisione_totale"):
         metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met).split(" - ")[0]
 
     st.markdown("---")
-    st.markdown("#### 💰 4. Sezione Contabile, IVA & Ritenuta d'Acconto")
+    st.markdown("#### 💰 4. Sezione Contabile, IVA & Ritenuta")
     ce1, ce2, ce3, ce4 = st.columns(4)
     with ce1:
-        imponibile_1 = st.number_input("Imponibile (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
+        imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
     with ce2:
         aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0)
     with ce3:
         imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
     with ce4:
-        ritenuta_1 = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01, help="Es. 20% professionisti (detratta dal netto a pagare)")
+        ritenuta_1 = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01)
 
     col_t1, col_t2 = st.columns([3, 1])
     with col_t1:
-        natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per Fornitori UE)", value=str(inv.get("natura", "")))
+        natura_default = "N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else str(inv.get("natura", ""))
+        natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per Fornitori UE)", value=natura_default)
     with col_t2:
         totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
-    btn_submit = st.form_submit_button("✅ Conferma Dati e Genera XML FPR12 per CONSPAY", type="primary", use_container_width=True)
+    btn_submit = st.form_submit_button("✅ Conferma Dati e Genera XML Conforme SdI / TeamSystem", type="primary", use_container_width=True)
 
 if btn_submit:
     righe_iva = [{"aliquota": aliquota_1, "imponibile": imponibile_1, "imposta": imposta_1, "natura": natura_iva.strip().upper()}]
@@ -248,7 +262,12 @@ if btn_submit:
     }
 
     xml_text = genera_xml_teamsystem(payload)
-    base_file = f"{ced_paese}{ced_piva}_{num_doc.replace('/', '_')}"
+    
+    # RECOLA NOMENCLATURA UFFICIALE AGENZIA DELLE ENTRATE:
+    # IT + P.IVA Trasmittente (Cliente Studio) + _ + Progressivo 5 caratteri
+    piva_trasmittente = cess_piva if cess_piva else "00000000000"
+    base_file = f"IT{piva_trasmittente}_00001"
+    
     st.session_state["xml_content"] = xml_text
     st.session_state["xml_filename"] = f"{base_file}.xml"
 
@@ -260,15 +279,15 @@ if btn_submit:
 
 if st.session_state["xml_content"] is not None:
     st.markdown("---")
-    st.subheader("📦 Step 3: XML Pronto per CONSPAY")
+    st.subheader("📦 Step 3: XML Pronto per Invio SdI / Import TeamSystem")
     is_ok, anomalie = st.session_state["validation_report"]
 
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success("✅ **Quadratura e Dati Fiscali Validi**: Documento pronto per l'importazione.")
+            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nome file `{st.session_state['xml_filename']}` conforme alle regole SdI.")
         else:
-            st.warning("⚠️ **Segnalazioni contabili:**")
+            st.warning("⚠️ **Segnalazioni di quadratura:**")
             for a in anomalie:
                 st.write(f"- {a}")
 
@@ -288,7 +307,7 @@ if st.session_state["xml_content"] is not None:
 
     with c2:
         st.download_button(
-            "💾 Scarica solo XML FPR12",
+            "💾 Scarica XML (Nome Ufficiale SdI)",
             data=st.session_state["xml_content"],
             file_name=st.session_state["xml_filename"],
             mime="application/xml",
@@ -303,5 +322,5 @@ if st.session_state["xml_content"] is not None:
             use_container_width=True
         )
 
-    with st.expander("🔍 Ispezione Tracciato XML FPR12"):
+    with st.expander("🔍 Ispezione Tracciato XML FPR12 Ufficiale"):
         st.code(st.session_state["xml_content"], language="xml")
