@@ -1,40 +1,52 @@
-# validator.py
+# validator.py - Validazione Contabile FatturaPA FPR12 e Normativa IVA Intra-UE
 import re
-from typing import Dict, Any, List, Tuple
+from typing import List, Dict, Tuple
 
-def valida_partita_iva(piva: str) -> bool:
-    """Verifica formale della Partita IVA italiana (11 cifre + algoritmo di Luhn per IT)."""
-    piva = re.sub(r"[^0-9]", "", str(piva))
-    if len(piva) != 11:
-        return False
+def valida_partita_iva_internazionale(piva: str, paese: str = "IT") -> bool:
+    """Verifica P.IVA italiane (con formula di Luhn) o estere comunitarie (VIES/UE)."""
+    piva = re.sub(r"[^A-Za-z0-9]", "", str(piva)).upper()
+    paese = str(paese).strip().upper()
     
-    s = 0
-    for i in range(10):
-        c = int(piva[i])
-        if i % 2 == 1:
-            c *= 2
-            if c > 9:
-                c -= 9
-        s += c
-    controllo = (10 - (s % 10)) % 10
-    return controllo == int(piva[10])
+    if not piva:
+        return False
 
+    # 1. Partita IVA Italiana
+    if paese == "IT":
+        if len(piva) != 11 or not piva.isdigit():
+            return False
+        s = 0
+        for i in range(10):
+            c = int(piva[i])
+            if i % 2 == 1:
+                c *= 2
+                if c > 9:
+                    c -= 9
+            s += c
+        controllo = (10 - (s % 10)) % 10
+        return controllo == int(piva[10])
 
-def valida_codice_fiscale(cf: str) -> bool:
-    """Verifica sintattica del Codice Fiscale italiano ordinario a 16 caratteri."""
-    cf = str(cf).strip().upper()
-    regex_cf = r"^[A-Z]{6}[0-9]{2}[A-Z][0-9]{2}[A-Z][0-9]{3}[A-Z]$"
-    return bool(re.match(regex_cf, cf))
+    # 2. Fornitori Comunitari (es. Francia FR: 2 caratteri + 9 cifre; Germania DE: 9 cifre)
+    if paese == "FR":
+        return len(piva) == 11
+    if paese == "DE":
+        return len(piva) == 9 and piva.isdigit()
+    
+    # Standard generale estero UE: tra 4 e 15 caratteri alfanumerici
+    return 4 <= len(piva) <= 15
 
+def valida_codice_destinatario(sdi: str) -> bool:
+    """Il codice destinatario SdI deve essere esattamente di 7 caratteri alfanumerici."""
+    sdi = str(sdi).strip()
+    return len(sdi) == 7 and bool(re.match(r"^[A-Za-z0-9]{7}$", sdi))
 
 def valida_quadratura_completa(
-    riepilogo_iva: List[Dict[str, float]], 
+    riepilogo_iva: List[Dict], 
     totale_documento: float,
     ritenuta: float = 0.0,
     bollo: float = 0.0,
     cassa_previdenza: float = 0.0
 ) -> Tuple[bool, List[str]]:
-    """Esegue il controllo di quadratura su imponibili, imposte e totale fattura."""
+    """Esegue controlli di coerenza contabile, con focus su operazioni N3.2 (Intra-UE)."""
     errori = []
     totale_imponibile = 0.0
     totale_imposta = 0.0
@@ -43,32 +55,32 @@ def valida_quadratura_completa(
         imponibile = round(float(rigo.get("imponibile", 0.0)), 2)
         aliquota = float(rigo.get("aliquota", 0.0))
         imposta_dichiarata = round(float(rigo.get("imposta", 0.0)), 2)
-        natura = str(rigo.get("natura", "")).strip()
+        natura = str(rigo.get("natura", "")).strip().upper()
 
         if aliquota == 0.0:
             if not natura:
-                errori.append(f"Rigo {idx}: Aliquota 0% priva di Natura esenzione (es. N1, N2.2, N3, N4).")
+                errori.append(f"Rigo {idx}: Aliquota 0% priva di Natura IVA obbligatoria (es. N3.2 per Fornitori UE).")
             if imposta_dichiarata != 0.0:
-                errori.append(f"Rigo {idx}: Aliquota 0% con imposta valorizzata a {imposta_dichiarata:.2f}€.")
+                errori.append(f"Rigo {idx}: Con Natura {natura} l'imposta IVA deve essere 0.00€ (rilevati {imposta_dichiarata}€).")
         else:
             imposta_calcolata = round((imponibile * aliquota) / 100.0, 2)
             if abs(imposta_calcolata - imposta_dichiarata) > 0.02:
                 errori.append(
-                    f"Rigo {idx}: Errore IVA {aliquota}%. "
-                    f"Dichiarata: {imposta_dichiarata:.2f}€, Calcolata: {imposta_calcolata:.2f}€."
+                    f"Rigo {idx}: IVA al {aliquota}% disallineata: calcolata {imposta_calcolata}€ vs dichiarata {imposta_dichiarata}€."
                 )
 
         totale_imponibile += imponibile
         totale_imposta += imposta_dichiarata
 
+    # Chiusura documento
     totale_teorico = round(totale_imponibile + totale_imposta + cassa_previdenza + bollo, 2)
-    diff_lordo = abs(totale_teorico - totale_documento)
-    diff_netto = abs((totale_teorico - ritenuta) - totale_documento)
+    diff = min(abs(totale_teorico - totale_documento), abs((totale_teorico - ritenuta) - totale_documento))
 
-    if diff_lordo > 0.02 and diff_netto > 0.02:
+    if diff > 0.05:
         errori.append(
-            f"Asimmetria Totale: Teorico {totale_teorico:.2f}€ (netto {totale_teorico - ritenuta:.2f}€), "
-            f"Dichiarato: {totale_documento:.2f}€."
+            f"Quadratura fallita: Totale calcolato ({totale_teorico:.2f}€) non coincide con il Totale Documento ({totale_documento:.2f}€)."
         )
 
     return (len(errori) == 0), errori
+
+valida_partita_iva = valida_partita_iva_internazionale
