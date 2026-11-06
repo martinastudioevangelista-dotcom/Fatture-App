@@ -137,4 +137,166 @@ with st.form("form_revisione_totale"):
 
     st.markdown("---")
     st.markdown("#### 🏢 2. Anagrafiche Fiscali Segregate")
-    col_ced,
+    col_ced, col_cess = st.columns(2)
+    
+    with col_ced:
+        st.markdown("**FORNITORE (Cedente / Prestatore - Chi emette)**")
+        ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "")))
+        c_p1, c_p2 = st.columns([1, 3])
+        ced_paese = c_p1.text_input("Paese Fornitore", value=str(inv.get("cedente_paese", "IT"))[:2].upper(), max_chars=2)
+        ced_piva = c_p2.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")))
+        ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")))
+        ci1, ci2, ci3 = st.columns([2, 3, 1])
+        ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
+        ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
+        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
+
+    with col_cess:
+        st.markdown("**CLIENTE STUDIO (Cessionario / Committente - Chi riceve)**")
+        cess_nome = st.text_input("Denominazione Cliente", value=str(inv.get("cessionario_denominazione", "")))
+        cs_p1, cs_p2 = st.columns([1, 3])
+        cess_paese = cs_p1.text_input("Paese Cliente", value=str(inv.get("cessionario_paese", "IT"))[:2].upper(), max_chars=2)
+        cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
+        cess_cf = st.text_input("Codice Fiscale Cliente (se privato)", value=str(inv.get("cessionario_cf", "")))
+        cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "")))
+        cs1, cs2, cs3 = st.columns([2, 3, 1])
+        cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
+        cess_com = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
+        cess_prov = cs3.text_input("Prov. Cliente", value=str(inv.get("cessionario_provincia", "RM"))[:2].upper(), max_chars=2)
+
+    st.markdown("---")
+    st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY")
+    cp1, cp2, cp3 = st.columns([2, 1, 1])
+    with cp1:
+        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Se vuoto, la riconciliazione su CONSPAY avverrà tramite numero fattura e importo.")
+    with cp2:
+        try:
+            d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
+        except Exception:
+            d_scad = d_val
+        scadenza_pag = st.date_input("Scadenza Pagamento", value=d_scad)
+    with cp3:
+        metodo_default = inv.get("modalita_pagamento", "MP05")
+        metodi_list = ["MP05 - Bonifico Bancario", "MP08 - Carta di Pagamento", "MP12 - RiBa", "MP01 - Contanti"]
+        idx_met = 1 if metodo_default == "MP08" else 0
+        metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met).split(" - ")[0]
+
+    st.markdown("---")
+    st.markdown("#### 💰 4. Sezione Contabile & Quadratura IVA")
+    ce1, ce2, ce3, ce4 = st.columns(4)
+    with ce1:
+        imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
+    with ce2:
+        aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0)
+    with ce3:
+        natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per UE)", value=str(inv.get("natura", "")))
+    with ce4:
+        imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
+
+    totale_doc = st.number_input("Totale Documento (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
+
+    btn_submit = st.form_submit_button("✅ Conferma Dati e Genera XML FPR12 per CONSPAY", type="primary", use_container_width=True)
+
+if btn_submit:
+    righe_iva = [{"aliquota": aliquota_1, "imponibile": imponibile_1, "imposta": imposta_1, "natura": natura_iva.strip().upper()}]
+    segnalazioni = []
+    if ced_piva and not valida_partita_iva(ced_piva, ced_paese):
+        segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non valida.")
+    if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
+        segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
+
+    quadratura_ok, errs = valida_quadratura(righe_iva, totale_doc)
+    st.session_state["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
+
+    payload = {
+        "tipo_documento": tipo_doc,
+        "numero_documento": num_doc,
+        "data_documento": data_doc.strftime("%Y-%m-%d"),
+        "codice_destinatario": cod_sdi,
+        "regime_fiscale": "RF01",
+        "cedente_denominazione": ced_nome,
+        "cedente_paese": ced_paese,
+        "cedente_piva": ced_piva,
+        "cedente_indirizzo": ced_via,
+        "cedente_cap": ced_cap,
+        "cedente_comune": ced_com,
+        "cedente_provincia": ced_prov if ced_paese == "IT" else "",
+        "cessionario_denominazione": cess_nome,
+        "cessionario_paese": cess_paese,
+        "cessionario_piva": cess_piva,
+        "cessionario_cf": cess_cf,
+        "cessionario_indirizzo": cess_via,
+        "cessionario_cap": cess_cap,
+        "cessionario_comune": cess_com,
+        "cessionario_provincia": cess_prov,
+        "riepilogo_iva": righe_iva,
+        "totale_documento": totale_doc,
+        "iban": iban_doc,
+        "data_scadenza": scadenza_pag.strftime("%Y-%m-%d"),
+        "modalita_pagamento": metodo_pag,
+        "linee": [{
+            "descrizione": f"Prestazioni/Merci fattura n. {num_doc}",
+            "prezzo_totale": imponibile_1,
+            "aliquota": aliquota_1,
+            "natura": natura_iva.strip().upper() if aliquota_1 == 0.0 else ""
+        }]
+    }
+
+    xml_text = genera_xml_teamsystem(payload)
+    base_file = f"{ced_paese}{ced_piva}_{num_doc.replace('/', '_')}"
+    st.session_state["xml_content"] = xml_text
+    st.session_state["xml_filename"] = f"{base_file}.xml"
+
+    if salva_drive and GDRIVE_OK:
+        with st.spinner("Archiviazione Google Drive..."):
+            uploaded_file.seek(0)
+            ok, msg = upload_to_drive(uploaded_file.read(), xml_text, cess_nome, base_file)
+            st.session_state["gdrive_status"] = (ok, msg)
+
+if st.session_state["xml_content"] is not None:
+    st.markdown("---")
+    st.subheader("📦 Step 3: XML Pronto per CONSPAY")
+    is_ok, anomalie = st.session_state["validation_report"]
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if is_ok:
+            st.success("✅ **Quadratura e Dati Fiscali Validi**: Documento pronto per l'importazione.")
+        else:
+            st.warning("⚠️ **Segnalazioni contabili:**")
+            for a in anomalie:
+                st.write(f"- {a}")
+
+        if st.session_state["gdrive_status"] is not None:
+            g_ok, g_msg = st.session_state["gdrive_status"]
+            if g_ok:
+                st.info(f"☁️ {g_msg}")
+            else:
+                st.warning(f"☁️ {g_msg}")
+
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"])
+        uploaded_file.seek(0)
+        z.writestr(uploaded_file.name, uploaded_file.read())
+    zip_bytes.seek(0)
+
+    with c2:
+        st.download_button(
+            "💾 Scarica solo XML FPR12",
+            data=st.session_state["xml_content"],
+            file_name=st.session_state["xml_filename"],
+            mime="application/xml",
+            use_container_width=True
+        )
+        st.download_button(
+            "🗂️ Scarica Pacchetto ZIP (PDF + XML)",
+            data=zip_bytes,
+            file_name=f"Fattura_{st.session_state['xml_filename'].replace('.xml', '')}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+    with st.expander("🔍 Ispezione Tracciato XML FPR12"):
+        st.code(st.session_state["xml_content"], language="xml")
