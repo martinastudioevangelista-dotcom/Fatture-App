@@ -1,11 +1,11 @@
-# validator.py - Validazione Contabile FatturaPA FPR12 e Normativa IVA Intra-UE
+# validator.py - Validazione Fiscale FPR12 e Normativa IVA Intra-UE
 import re
 from typing import List, Dict, Tuple
 
 def valida_partita_iva_internazionale(piva: str, paese: str = "IT") -> bool:
-    """Verifica P.IVA italiane (con formula di Luhn) o estere comunitarie (VIES/UE)."""
+    """Verifica P.IVA italiane (formula di Luhn) o estere comunitarie (VIES/UE)."""
     piva = re.sub(r"[^A-Za-z0-9]", "", str(piva)).upper()
-    paese = str(paese).strip().upper()
+    paese = str(paese).strip().upper() if paese else "IT"
     
     if not piva:
         return False
@@ -25,7 +25,7 @@ def valida_partita_iva_internazionale(piva: str, paese: str = "IT") -> bool:
         controllo = (10 - (s % 10)) % 10
         return controllo == int(piva[10])
 
-    # 2. Fornitori Comunitari (es. Francia FR: 2 caratteri + 9 cifre; Germania DE: 9 cifre)
+    # 2. Fornitori Comunitari (es. Francia FR: 11 caratteri; Germania DE: 9 cifre)
     if paese == "FR":
         return len(piva) == 11
     if paese == "DE":
@@ -46,7 +46,7 @@ def valida_quadratura_completa(
     bollo: float = 0.0,
     cassa_previdenza: float = 0.0
 ) -> Tuple[bool, List[str]]:
-    """Esegue controlli di coerenza contabile, con focus su operazioni N3.2 (Intra-UE)."""
+    """Verifica coerenza contabile, con supporto a Natura N3.2 per Fornitori UE."""
     errori = []
     totale_imponibile = 0.0
     totale_imposta = 0.0
@@ -83,4 +83,5 @@ def valida_quadratura_completa(
 
     return (len(errori) == 0), errori
 
+# ALIAS DI COMPATIBILITÀ BIDIREZIONALE PER EVITARE QUALSIASI IMPORTERROR
 valida_partita_iva = valida_partita_iva_internazionale
