@@ -186,11 +186,27 @@ def parser_locale_fattura(testo):
     }
 
 def estrai_con_gemini(file_bytes, filename, api_key, testo):
-    """Chiamata a Gemini protetta senza f-string a rischio."""
+    """Rileva automaticamente il modello Gemini attivo sull'account per evitare il 404."""
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        # Rileva dinamicamente il modello disponibile per questo account
+        nome_modello = "gemini-1.5-flash-latest"
+        try:
+            modelli_disp = [
+                m.name for m in genai.list_models() 
+                if "generateContent" in m.supported_generation_methods
+            ]
+            flash_attivi = [m for m in modelli_disp if "flash" in m.lower()]
+            if flash_attivi:
+                nome_modello = flash_attivi[0]
+            elif modelli_disp:
+                nome_modello = modelli_disp[0]
+        except Exception:
+            nome_modello = "gemini-1.5-flash-latest"
+
+        model = genai.GenerativeModel(nome_modello)
 
         prompt = (
             "Estrai i dati fiscali da questa fattura per TeamSystem CONSPAY in JSON.\n"
@@ -201,7 +217,7 @@ def estrai_con_gemini(file_bytes, filename, api_key, testo):
             "Testo del documento:\n" + str(testo)[:5000]
         )
 
-        response = model.generate_content(prompt, request_options={"timeout": 12.0})
+        response = model.generate_content(prompt, request_options={"timeout": 14.0})
         raw = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
 
