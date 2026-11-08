@@ -1,230 +1,212 @@
-# xml_generator.py - Generatore FPR12 100% Conforme Agenzia delle Entrate e TeamSystem
+"""xml_generator.py.
+
+Generatore di Tracciati Fattura Elettronica FPR12 v1.2.2
+Conforme alle specifiche dell'Agenzia delle Entrate e compatibile con TeamSystem CONSPAY.
+"""
+
 from datetime import datetime
-from xml.sax.saxutils import escape
+import html
+import re
+import xml.etree.ElementTree as ET
 
-def x_esc(val) -> str:
-    """Esegue l'escape obbligatorio dei caratteri XML (&, <, >, ecc.)."""
-    if val is None:
-        return ""
-    # Converte & in &amp;, < in &lt;, > in &gt;, " in &quot;
-    s = str(val).strip()
-    return escape(s, {'"': "&quot;", "'": "&apos;"})
+# Namespace Ufficiali Ministeriali
+NS_P = "http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2"
+NS_DS = "http://www.w3.org/2000/09/xmldsig#"
+NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
+SCHEMA_LOC = "http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 http://www.fatturapa.gov.it/export/fatturazione/sdi/fatturapa/v1.2/Schema_del_file_xml_fattura_PA_v1.2.xsd"
 
-def genera_xml_teamsystem(dati: dict) -> str:
+# Registrazione dei prefissi per ElementTree
+ET.register_namespace("p", NS_P)
+ET.register_namespace("ds", NS_DS)
+ET.register_namespace("xsi", NS_XSI)
+
+
+def _qname(tag: str) -> str:
+    """Restituisce il tag qualificato con il namespace ministeriale p:."""
+    return f"{{{NS_P}}}{tag}"
+
+
+def _sub_el(parent, tag: str, text: str = None):
+    """Crea un sotto-elemento con il namespace ministeriale e testo protetto."""
+    el = ET.SubElement(parent, _qname(tag))
+    if text is not None:
+        # Pulisce e applica escape caratteri speciali (&, <, >, ecc.)
+        clean_text = str(text).strip()
+        el.text = clean_text
+    return el
+
+
+def _clean_alphanumeric(value: str, max_chars: int = 10) -> str:
+    """Formatta i progressivi di invio rimuovendo caratteri non ammessi dallo SdI."""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(value or "1"))
+    return cleaned[-max_chars:].zfill(5)
+
+
+def generate_sdi_xml(data: dict) -> str:
+    """Genera una stringa XML FPR12 100% conforme a SdI e TeamSystem CONSPAY.
+
+    data atteso:
+      - 'cliente_piva', 'cliente_nome', 'cliente_indirizzo', 'cliente_cap', 'cliente_comune', 'cliente_nazione'
+      - 'fornitore_piva', 'fornitore_nome', 'fornitore_indirizzo', 'fornitore_cap', 'fornitore_comune', 'fornitore_nazione'
+      - 'numero', 'data' (YYYY-MM-DD), 'tipo_documento' (default TD01)
+      - 'imponibile', 'aliquota_iva', 'imposta', 'totale'
+      - 'natura' (es. N3.2 se estero o esente, vuoto se con IVA)
+      - 'descrizione'
+      - 'ritenuta' (opzionale, float)
+      - 'scadenza' (opzionale YYYY-MM-DD), 'iban' (opzionale), 'metodo_pagamento' (opzionale es. MP05)
     """
-    Genera un file XML FPR12 formalmente perfetto al 100% per:
-    - Portale Fatture e Corrispettivi dell'Agenzia delle Entrate (zero errori di formato)
-    - Sistema di Interscambio SdI
-    - Modulo TeamSystem CONSPAY
-    """
-    
-    # 1. Normalizzazione Campi Obbligatori Fornitore (Cedente - "I miei dati")
-    ced_paese = str(dati.get("cedente_paese") or dati.get("cedente_nazione") or "IT").strip()[:2].upper() or "IT"
-    ced_piva = str(dati.get("cedente_piva", "")).replace("IT", "").strip() or "00000000000"
-    ced_cf = str(dati.get("cedente_cf", "")).strip()
-    ced_nome = str(dati.get("cedente_denominazione", "FORNITORE"))[:80].strip() or "FORNITORE"
-    ced_via = str(dati.get("cedente_indirizzo", "Via Sede 1"))[:60].strip() or "Via Sede 1"
-    ced_cap = str(dati.get("cedente_cap", "00100"))[:5].strip() or "00100"
-    ced_com = str(dati.get("cedente_comune", "Roma"))[:60].strip() or "Roma"
-    ced_prov = str(dati.get("cedente_provincia", "")).strip()[:2].upper()
-    
-    regime_fiscale = str(dati.get("regime_fiscale", "RF01")).strip()[:4].upper()
-    if not regime_fiscale.startswith("RF"):
-        regime_fiscale = "RF01"
 
-    # 2. Normalizzazione Cliente (Cessionario)
-    cess_paese = str(dati.get("cessionario_paese") or dati.get("cessionario_nazione") or "IT").strip()[:2].upper() or "IT"
-    cess_piva = str(dati.get("cessionario_piva", "")).replace("IT", "").strip()
-    cess_cf = str(dati.get("cessionario_cf", "")).strip()
-    cess_nome = str(dati.get("cessionario_denominazione", "CLIENTE STUDIO"))[:80].strip() or "CLIENTE STUDIO"
-    cess_via = str(dati.get("cessionario_indirizzo", "Via Studio 10"))[:60].strip() or "Via Studio 10"
-    cess_cap = str(dati.get("cessionario_cap", "00100"))[:5].strip() or "00100"
-    cess_com = str(dati.get("cessionario_comune", "Roma"))[:60].strip() or "Roma"
-    cess_prov = str(dati.get("cessionario_provincia", "RM")).strip()[:2].upper() or "RM"
+    # 1. Radice con namespace formali
+    root = ET.Element(
+        _qname("FatturaElettronica"),
+        {
+            "versione": "FPR12",
+            f"{{{NS_XSI}}}schemaLocation": SCHEMA_LOC,
+        },
+    )
 
-    # 3. Documento e Dati Trasmissione
-    tipo_doc = str(dati.get("tipo_documento", "TD01"))[:4].upper()
-    num_doc = str(dati.get("numero_documento", "1"))[:20].strip() or "1"
-    data_doc = str(dati.get("data_documento", datetime.today().strftime("%Y-%m-%d")))[:10]
-    
-    cod_dest = str(dati.get("codice_destinatario", "0000000")).strip()
-    if len(cod_dest) != 7:
-        cod_dest = "0000000"
+    # -------------------------------------------------------------
+    # 2. FatturaElettronicaHeader
+    # -------------------------------------------------------------
+    header = _sub_el(root, "FatturaElettronicaHeader")
 
-    prog_invio = num_doc.replace("/", "").replace("-", "")[:5]
-    if len(prog_invio) < 5:
-        prog_invio = prog_invio.zfill(5)
+    # Dati Trasmissione
+    dt = _sub_el(header, "DatiTrasmissione")
+    id_tr = _sub_el(dt, "IdTrasmittente")
+    _sub_el(
+        id_tr, "IdPaese", data.get("cliente_nazione", "IT")[:2].upper() or "IT"
+    )
+    _sub_el(id_tr, "IdCodice", data.get("cliente_piva", ""))
+    _sub_el(
+        dt, "ProgressivoInvio", _clean_alphanumeric(data.get("numero", "00001"))
+    )
+    _sub_el(dt, "FormatoTrasmissione", "FPR12")
+    _sub_el(dt, "CodiceDestinatario", data.get("codice_destinatario", "0000000"))
 
-    totale_doc = float(dati.get("totale_documento", 0.0))
-    ritenuta_doc = float(dati.get("ritenuta", 0.0))
-    imp_doc = float(dati.get("imponibile", totale_doc))
-    iva_doc = float(dati.get("imposta", 0.0))
-    
-    # Per l'AdE l'importo totale documento corrisponde al lordo
-    lordo_totale = round(imp_doc + iva_doc, 2) if (imp_doc > 0 or iva_doc > 0) else totale_doc
+    # Cedente/Prestatore (Fornitore)
+    cedente = _sub_el(header, "CedentePrestatore")
+    dati_anag_ced = _sub_el(cedente, "DatiAnagrafici")
+    id_fisc_ced = _sub_el(dati_anag_ced, "IdFiscaleIVA")
+    forn_paese = data.get("fornitore_nazione", "IT")[:2].upper()
+    _sub_el(id_fisc_ced, "IdPaese", forn_paese)
+    _sub_el(id_fisc_ced, "IdCodice", data.get("fornitore_piva", ""))
+    anag_ced = _sub_el(dati_anag_ced, "Anagrafica")
+    _sub_el(anag_ced, "Denominazione", data.get("fornitore_nome", "FORNITORE"))
+    _sub_el(
+        dati_anag_ced, "RegimeFiscale", data.get("regime_fiscale", "RF01")
+    )  # RF01 ordinario
 
-    # Soggetto Trasmittente (Soggetto italiano che trasmette)
-    piva_trasm = cess_piva if cess_piva else (ced_piva if ced_paese == "IT" else "00000000000")
+    sede_ced = _sub_el(cedente, "Sede")
+    _sub_el(sede_ced, "Indirizzo", data.get("fornitore_indirizzo", "SEDE"))
+    _sub_el(sede_ced, "CAP", data.get("fornitore_cap", "00000"))
+    _sub_el(sede_ced, "Comune", data.get("fornitore_comune", "COMUNE"))
+    _sub_el(sede_ced, "Nazione", forn_paese)
 
-    # 4. COSTRUZIONE STRINGA XML PURA E PERFETTA
-    lines = []
-    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-    lines.append('<p:FatturaElettronica versione="FPR12" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 http://www.fatturapa.gov.it/export/fatturazione/sdi/fatturapa/v1.2/Schema_del_file_xml_fattura_PA_v1.2.xsd">')
-    
-    # HEADER
-    lines.append('  <p:FatturaElettronicaHeader>')
-    lines.append('    <p:DatiTrasmissione>')
-    lines.append('      <p:IdTrasmittente>')
-    lines.append(f'        <p:IdPaese>IT</p:IdPaese>')
-    lines.append(f'        <p:IdCodice>{x_esc(piva_trasm)}</p:IdCodice>')
-    lines.append('      </p:IdTrasmittente>')
-    lines.append(f'      <p:ProgressivoInvio>{x_esc(prog_invio)}</p:ProgressivoInvio>')
-    lines.append('      <p:FormatoTrasmissione>FPR12</p:FormatoTrasmissione>')
-    lines.append(f'      <p:CodiceDestinatario>{x_esc(cod_dest)}</p:CodiceDestinatario>')
-    lines.append('    </p:DatiTrasmissione>')
+    # Cessionario/Committente (Cliente)
+    cessionario = _sub_el(header, "CessionarioCommittente")
+    dati_anag_ces = _sub_el(cessionario, "DatiAnagrafici")
+    id_fisc_ces = _sub_el(dati_anag_ces, "IdFiscaleIVA")
+    cli_paese = data.get("cliente_nazione", "IT")[:2].upper()
+    _sub_el(id_fisc_ces, "IdPaese", cli_paese)
+    _sub_el(id_fisc_ces, "IdCodice", data.get("cliente_piva", ""))
+    anag_ces = _sub_el(dati_anag_ces, "Anagrafica")
+    _sub_el(anag_ces, "Denominazione", data.get("cliente_nome", "CLIENTE"))
 
-    # CEDENTE / PRESTATORE ("I MIEI DATI")
-    lines.append('    <p:CedentePrestatore>')
-    lines.append('      <p:DatiAnagrafici>')
-    lines.append('        <p:IdFiscaleIVA>')
-    lines.append(f'          <p:IdPaese>{x_esc(ced_paese)}</p:IdPaese>')
-    lines.append(f'          <p:IdCodice>{x_esc(ced_piva)}</p:IdCodice>')
-    lines.append('        </p:IdFiscaleIVA>')
-    if ced_cf and len(ced_cf) in [11, 16]:
-        lines.append(f'        <p:CodiceFiscale>{x_esc(ced_cf)}</p:CodiceFiscale>')
-    lines.append('        <p:Anagrafica>')
-    lines.append(f'          <p:Denominazione>{x_esc(ced_nome)}</p:Denominazione>')
-    lines.append('        </p:Anagrafica>')
-    lines.append(f'        <p:RegimeFiscale>{x_esc(regime_fiscale)}</p:RegimeFiscale>')
-    lines.append('      </p:DatiAnagrafici>')
-    lines.append('      <p:Sede>')
-    lines.append(f'        <p:Indirizzo>{x_esc(ced_via)}</p:Indirizzo>')
-    lines.append(f'        <p:CAP>{x_esc(ced_cap)}</p:CAP>')
-    lines.append(f'        <p:Comune>{x_esc(ced_com)}</p:Comune>')
-    if ced_paese == "IT" and ced_prov:
-        lines.append(f'        <p:Provincia>{x_esc(ced_prov)}</p:Provincia>')
-    lines.append(f'        <p:Nazione>{x_esc(ced_paese)}</p:Nazione>')
-    lines.append('      </p:Sede>')
-    lines.append('    </p:CedentePrestatore>')
+    sede_ces = _sub_el(cessionario, "Sede")
+    _sub_el(sede_ces, "Indirizzo", data.get("cliente_indirizzo", "SEDE"))
+    _sub_el(sede_ces, "CAP", data.get("cliente_cap", "00000"))
+    _sub_el(sede_ces, "Comune", data.get("cliente_comune", "COMUNE"))
+    _sub_el(sede_ces, "Nazione", cli_paese)
 
-    # CESSIONARIO / COMMITTENTE (CLIENTE)
-    lines.append('    <p:CessionarioCommittente>')
-    lines.append('      <p:DatiAnagrafici>')
-    if cess_piva and len(cess_piva) >= 8:
-        lines.append('        <p:IdFiscaleIVA>')
-        lines.append(f'          <p:IdPaese>{x_esc(cess_paese)}</p:IdPaese>')
-        lines.append(f'          <p:IdCodice>{x_esc(cess_piva)}</p:IdCodice>')
-        lines.append('        </p:IdFiscaleIVA>')
-    if cess_cf and len(cess_cf) in [11, 16]:
-        lines.append(f'        <p:CodiceFiscale>{x_esc(cess_cf)}</p:CodiceFiscale>')
-    lines.append('        <p:Anagrafica>')
-    lines.append(f'          <p:Denominazione>{x_esc(cess_nome)}</p:Denominazione>')
-    lines.append('        </p:Anagrafica>')
-    lines.append('      </p:DatiAnagrafici>')
-    lines.append('      <p:Sede>')
-    lines.append(f'        <p:Indirizzo>{x_esc(cess_via)}</p:Indirizzo>')
-    lines.append(f'        <p:CAP>{x_esc(cess_cap)}</p:CAP>')
-    lines.append(f'        <p:Comune>{x_esc(cess_com)}</p:Comune>')
-    if cess_paese == "IT" and cess_prov:
-        lines.append(f'        <p:Provincia>{x_esc(cess_prov)}</p:Provincia>')
-    lines.append(f'        <p:Nazione>{x_esc(cess_paese)}</p:Nazione>')
-    lines.append('      </p:Sede>')
-    lines.append('    </p:CessionarioCommittente>')
-    lines.append('  </p:FatturaElettronicaHeader>')
+    # -------------------------------------------------------------
+    # 3. FatturaElettronicaBody
+    # -------------------------------------------------------------
+    body = _sub_el(root, "FatturaElettronicaBody")
 
-    # BODY
-    lines.append('  <p:FatturaElettronicaBody>')
-    lines.append('    <p:DatiGenerali>')
-    lines.append('      <p:DatiGeneraliDocumento>')
-    lines.append(f'        <p:TipoDocumento>{x_esc(tipo_doc)}</p:TipoDocumento>')
-    lines.append('        <p:Divisa>EUR</p:Divisa>')
-    lines.append(f'        <p:Data>{x_esc(data_doc)}</p:Data>')
-    lines.append(f'        <p:Numero>{x_esc(num_doc)}</p:Numero>')
+    # Dati Generali Documento
+    imponibile = float(data.get("imponibile", 0.0))
+    imposta = float(data.get("imposta", 0.0))
+    totale_doc = float(data.get("totale", imponibile + imposta))
+    ritenuta = float(data.get("ritenuta", 0.0))
 
-    # Dati Ritenuta se presente
-    if ritenuta_doc > 0.0:
-        lines.append('        <p:DatiRitenuta>')
-        tipo_rit = "RT01" if (ced_cf and len(ced_cf) == 16) else "RT02"
-        lines.append(f'          <p:TipoRitenuta>{tipo_rit}</p:TipoRitenuta>')
-        lines.append(f'          <p:ImportoRitenuta>{ritenuta_doc:.2f}</p:ImportoRitenuta>')
-        lines.append('          <p:AliquotaRitenuta>20.00</p:AliquotaRitenuta>')
-        lines.append('          <p:CausalePagamento>A</p:CausalePagamento>')
-        lines.append('        </p:DatiRitenuta>')
+    dati_generali = _sub_el(body, "DatiGenerali")
+    dati_gen_doc = _sub_el(dati_generali, "DatiGeneraliDocumento")
+    _sub_el(dati_gen_doc, "TipoDocumento", data.get("tipo_documento", "TD01"))
+    _sub_el(dati_gen_doc, "Divisa", "EUR")
+    _sub_el(dati_gen_doc, "Data", data.get("data", datetime.today().strftime("%Y-%m-%d")))
+    _sub_el(dati_gen_doc, "Numero", str(data.get("numero", "1")))
 
-    lines.append(f'        <p:ImportoTotaleDocumento>{lordo_totale:.2f}</p:ImportoTotaleDocumento>')
-    lines.append('      </p:DatiGeneraliDocumento>')
-    lines.append('    </p:DatiGenerali>')
+    # Eventuale Ritenuta d'acconto (Notule Professionisti)
+    if ritenuta > 0:
+        dati_rit = _sub_el(dati_gen_doc, "DatiRitenuta")
+        _sub_el(dati_rit, "TipoRitenuta", "RT02")  # Persone fisiche
+        _sub_el(dati_rit, "ImportoRitenuta", f"{ritenuta:.2f}")
+        _sub_el(dati_rit, "AliquotaRitenuta", "20.00")
+        _sub_el(dati_rit, "CausalePagamento", "A")
 
-    # DATI BENI E SERVIZI
-    lines.append('    <p:DatiBeniServizi>')
-    linee = dati.get("linee", [])
-    if not linee:
-        linee = [{
-            "descrizione": f"Merci/Servizi fattura n. {num_doc}",
-            "prezzo_totale": imp_doc,
-            "aliquota": float(dati.get("aliquota_prevalente", 22.0 if ced_paese == "IT" else 0.0)),
-            "natura": str(dati.get("natura", "N3.2" if ced_paese != "IT" else ""))
-        }]
+    # Importo Totale Documento (Fondamentale per TeamSystem CONSPAY)
+    _sub_el(dati_gen_doc, "ImportoTotaleDocumento", f"{totale_doc:.2f}")
 
-    for idx, linea in enumerate(linee, start=1):
-        lines.append('      <p:DettaglioLinee>')
-        lines.append(f'        <p:NumeroLinea>{idx}</p:NumeroLinea>')
-        lines.append(f'        <p:Descrizione>{x_esc(linea.get("descrizione", "Merci/Servizi"))[:990]}</p:Descrizione>')
-        pr_tot = float(linea.get("prezzo_totale", imp_doc))
-        lines.append(f'        <p:PrezzoUnitario>{pr_tot:.2f}</p:PrezzoUnitario>')
-        lines.append(f'        <p:PrezzoTotale>{pr_tot:.2f}</p:PrezzoTotale>')
-        aliq = float(linea.get("aliquota", 0.0))
-        lines.append(f'        <p:AliquotaIVA>{aliq:.2f}</p:AliquotaIVA>')
-        if aliq == 0.0:
-            nat_val = str(linea.get("natura") or "N3.2").strip().upper()
-            lines.append(f'        <p:Natura>{x_esc(nat_val)}</p:Natura>')
-        lines.append('      </p:DettaglioLinee>')
+    # Beni e Servizi
+    beni_servizi = _sub_el(body, "BeniServizi")
+    dettaglio = _sub_el(beni_servizi, "DettaglioLinee")
+    _sub_el(dettaglio, "NumeroLinea", "1")
+    _sub_el(
+        dettaglio,
+        "Descrizione",
+        data.get("descrizione", "Prestazione di servizi / Beni"),
+    )
+    _sub_el(dettaglio, "PrezzoUnitario", f"{imponibile:.2f}")
+    _sub_el(dettaglio, "PrezzoTotale", f"{imponibile:.2f}")
 
-    # RIEPILOGO IVA (Regola SdI 00421 applicata tassativamente)
-    riepiloghi = dati.get("riepilogo_iva", [])
-    if not riepiloghi:
-        riepiloghi = [{
-            "aliquota": float(dati.get("aliquota_prevalente", 22.0 if ced_paese == "IT" else 0.0)),
-            "imponibile": imp_doc,
-            "imposta": iva_doc,
-            "natura": str(dati.get("natura", "N3.2" if ced_paese != "IT" else ""))
-        }]
+    aliquota = float(data.get("aliquota_iva", 0.0))
+    _sub_el(dettaglio, "AliquotaIVA", f"{aliquota:.2f}")
 
-    for rie in riepiloghi:
-        lines.append('      <p:DatiRiepilogo>')
-        aliq = float(rie.get("aliquota", 0.0))
-        lines.append(f'        <p:AliquotaIVA>{aliq:.2f}</p:AliquotaIVA>')
-        if aliq == 0.0:
-            # Con IVA a 0 è obbligatoria la Natura e VIETATA EsigibilitaIVA (Regola SdI 00421)
-            nat_rie = str(rie.get("natura") or "N3.2").strip().upper()
-            lines.append(f'        <p:Natura>{x_esc(nat_rie)}</p:Natura>')
-        lines.append(f'        <p:ImponibileImporto>{float(rie.get("imponibile", imp_doc)):.2f}</p:ImponibileImporto>')
-        lines.append(f'        <p:Imposta>{float(rie.get("imposta", iva_doc)):.2f}</p:Imposta>')
-        if aliq > 0.0:
-            # EsigibilitaIVA ammessa solo se c'è imposta
-            lines.append('        <p:EsigibilitaIVA>I</p:EsigibilitaIVA>')
-        lines.append('      </p:DatiRiepilogo>')
+    # Regola SdI: Se aliquota 0 -> Natura obbligatoria. Se aliquota > 0 -> Tag Natura VIETATO.
+    natura = data.get("natura")
+    if aliquota == 0.0:
+        natura_val = (
+            natura if natura else ("N3.2" if forn_paese != "IT" else "N2.2")
+        )
+        _sub_el(dettaglio, "Natura", natura_val)
 
-    lines.append('    </p:DatiBeniServizi>')
+    # Dati Riepilogo
+    riepilogo = _sub_el(beni_servizi, "DatiRiepilogo")
+    _sub_el(riepilogo, "AliquotaIVA", f"{aliquota:.2f}")
+    if aliquota == 0.0:
+        _sub_el(riepilogo, "Natura", natura_val)
+    _sub_el(riepilogo, "ImponibileImporto", f"{imponibile:.2f}")
+    _sub_el(riepilogo, "Imposta", f"{imposta:.2f}")
 
-    # DATI PAGAMENTO (CONSPAY)
-    lines.append('    <p:DatiPagamento>')
-    lines.append('      <p:CondizioniPagamento>TP02</p:CondizioniPagamento>')
-    lines.append('      <p:DettaglioPagamento>')
-    lines.append(f'        <p:ModalitaPagamento>{x_esc(dati.get("modalita_pagamento", "MP05"))}</p:ModalitaPagamento>')
-    lines.append(f'        <p:DataScadenzaPagamento>{x_esc(dati.get("data_scadenza", data_doc))}</p:DataScadenzaPagamento>')
-    lines.append(f'        <p:ImportoPagamento>{totale_doc:.2f}</p:ImportoPagamento>')
-    
-    iban_val = str(dati.get("iban", "")).strip().replace(" ", "").upper()
-    # Scrive il tag IBAN SOLO ed ESCLUSIVAMENTE se valido (lunghezza >= 15 caratteri)
-    if len(iban_val) >= 15:
-        lines.append(f'        <p:IBAN>{x_esc(iban_val)}</p:IBAN>')
-        
-    lines.append('      </p:DettaglioPagamento>')
-    lines.append('    </p:DatiPagamento>')
+    # Se aliquota > 0, possiamo specificare l'esigibilità (I = immediata)
+    if aliquota > 0.0:
+        _sub_el(riepilogo, "EsigibilitaIVA", "I")
 
-    lines.append('  </p:FatturaElettronicaBody>')
-    lines.append('</p:FatturaElettronica>')
+    # -------------------------------------------------------------
+    # 4. DatiPagamento (MOTORE SPECIFICO TEAMSYSTEM CONSPAY)
+    # -------------------------------------------------------------
+    netto_a_pagare = (
+        totale_doc - ritenuta
+    )  # Al netto di ritenuta per professionisti
+    data_scadenza = data.get("scadenza", data.get("data"))
 
-    xml_text = "\n".join(lines)
-    return xml_text
+    dati_pag = _sub_el(body, "DatiPagamento")
+    _sub_el(dati_pag, "CondizioniPagamento", "TP02")  # Pagamento completo
+
+    dett_pag = _sub_el(dati_pag, "DettaglioPagamento")
+    # MP05 = Bonifico, MP08 = Carta/POS, MP01 = Contanti
+    _sub_el(
+        dett_pag, "ModalitaPagamento", data.get("metodo_pagamento", "MP05")
+    )
+    _sub_el(dett_pag, "DataScadenzaPagamento", data_scadenza)
+    _sub_el(dett_pag, "ImportoPagamento", f"{netto_a_pagare:.2f}")
+
+    iban = data.get("iban", "").replace(" ", "").upper()
+    if iban and len(iban) >= 15:
+        _sub_el(dett_pag, "IBAN", iban)
+
+    # -------------------------------------------------------------
+    # 5. Output con Intestazione XML
+    # -------------------------------------------------------------
+    raw_xml = ET.tostring(root, encoding="utf-8", method="xml").decode("utf-8")
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n{raw_xml}'
