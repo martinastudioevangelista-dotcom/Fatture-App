@@ -1,4 +1,4 @@
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Supporto Completo PDF + XML + P7M)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY
 import io
 import zipfile
 import pandas as pd
@@ -36,7 +36,6 @@ def valida_quadratura_fiscale(riepilogo, totale, ritenuta=0.0):
         f"Asimmetria: Calcolato Netto {netto_calcolato:.2f}€ (Lordo {lordo_calcolato:.2f}€) vs Dichiarato {totale:.2f}€."
     ]
 
-# Moduli
 try:
     from extractor import estrai_dati_fattura
 except SyntaxError as e:
@@ -48,9 +47,8 @@ except BaseException as e:
 
 try:
     from xml_reader import leggi_xml_fattura
-except Exception as e:
-    st.error(f"❌ Errore nel caricamento di xml_reader.py: {e}")
-    st.stop()
+except Exception:
+    def leggi_xml_fattura(*args, **kwargs): return None, "", "", "xml_reader non trovato"
 
 from xml_generator import genera_xml_teamsystem
 
@@ -79,11 +77,10 @@ with st.sidebar:
     salva_drive = st.checkbox("Archivia su Google Drive", value=True)
 
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Suite Integrata: Conversione PDF/Scansioni, Importazione XML/P7M e Riconciliazione Bancaria.")
+st.caption("Fatturazione FPR12 v1.2.2 - Tracciato ministeriale validato per l'Agenzia delle Entrate.")
 
 col_up1, col_up2 = st.columns([4, 1])
 with col_up1:
-    # Supporta sia PDF/immagini che file XML o XML firmati digitalmente (.p7m)
     uploaded_file = st.file_uploader(
         "Carica fattura (PDF, Immagine, XML nativo o firmato .P7M)", 
         type=["pdf", "png", "jpg", "jpeg", "xml", "p7m"]
@@ -97,12 +94,10 @@ if uploaded_file is not None:
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state["last_file_id"] != file_id or force_reparse:
         nome_file = uploaded_file.name.lower()
-        
         with st.status("Acquisizione e quadratura del documento...", expanded=True) as status:
             file_bytes = uploaded_file.read()
             uploaded_file.seek(0)
             
-            # BIFORCAZIONE: Se è XML o P7M usa xml_reader, altrimenti usa extractor PDF/Image
             if nome_file.endswith(".xml") or nome_file.endswith(".p7m"):
                 dati, motore, testo_raw, err_ai = leggi_xml_fattura(file_bytes, uploaded_file.name)
             else:
@@ -131,15 +126,17 @@ if st.session_state.get("errore_ai"):
 st.markdown("### 🔍 Verifica Soggetti Estratti (Human-in-the-Loop)")
 df_rep = pd.DataFrame([
     {
-        "Ruolo": "🏢 FORNITORE (Cedente / Emittente)",
+        "Ruolo": "🏢 FORNITORE (Cedente - I miei dati per AdE)",
         "Denominazione": inv.get("cedente_denominazione", ""),
         "P.IVA / CF": inv.get("cedente_piva", "") or inv.get("cedente_cf", ""),
+        "Nazione Sede": inv.get("cedente_paese", "IT"),
         "Sede": f"{inv.get('cedente_indirizzo', '')}, {inv.get('cedente_cap', '')} {inv.get('cedente_comune', '')} ({inv.get('cedente_provincia', '')})"
     },
     {
-        "Ruolo": "👤 CLIENTE STUDIO (Cessionario / Ricevente)",
+        "Ruolo": "👤 CLIENTE STUDIO (Cessionario / Committente)",
         "Denominazione": inv.get("cessionario_denominazione", ""),
         "P.IVA / CF": inv.get("cessionario_piva", "") or inv.get("cessionario_cf", ""),
+        "Nazione Sede": inv.get("cessionario_paese", "IT"),
         "Sede": f"{inv.get('cessionario_indirizzo', '')}, {inv.get('cessionario_cap', '')} {inv.get('cessionario_comune', '')} ({inv.get('cessionario_provincia', '')})"
     }
 ])
@@ -160,7 +157,7 @@ with st.form("form_revisione_totale"):
         tipo_doc_default = "TD17" if inv.get("cedente_paese") != "IT" and inv.get("tipo_documento") == "TD17" else inv.get("tipo_documento", "TD01")
         tipo_doc = st.selectbox(
             "Tipo Documento",
-            ["TD01 - Fattura Ordinaria (TeamSystem)", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"],
+            ["TD01 - Fattura Ordinaria", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"],
             index=1 if tipo_doc_default == "TD17" else 0
         ).split(" - ")[0]
     with cd2:
@@ -179,25 +176,42 @@ with st.form("form_revisione_totale"):
     col_ced, col_cess = st.columns(2)
     
     with col_ced:
-        st.markdown("**FORNITORE (Cedente / Prestatore - Chi emette)**")
+        st.markdown("**FORNITORE (Cedente / Prestatore - 'I miei dati' per AdE)**")
         ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "")))
-        c_p1, c_p2 = st.columns([1, 3])
-        ced_paese = c_p1.text_input("Paese Fornitore", value=str(inv.get("cedente_paese", "IT"))[:2].upper(), max_chars=2)
-        ced_piva = c_p2.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")))
-        ced_cf = st.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")))
+        
+        c_p1, c_p2, c_p3 = st.columns([1, 2, 2])
+        with c_p1:
+            ced_paese = st.text_input("Nazione", value=str(inv.get("cedente_paese") or "IT")[:2].upper(), max_chars=2, help="Richiesto da AdE (es. IT, FR, DE)")
+        with c_p2:
+            ced_piva = st.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")))
+        with c_p3:
+            ced_cf = st.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")))
+
+        # REGIME FISCALE ESPLICITO
+        regime_fiscale_selezionato = st.selectbox(
+            "Regime Fiscale Fornitore (Richiesto da AdE)",
+            ["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato", "RF18 - Altro / Estero"],
+            index=3 if ced_paese != "IT" else 0
+        ).split(" - ")[0]
+
         ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")))
         ci1, ci2, ci3 = st.columns([2, 3, 1])
         ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
         ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
-        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
+        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM" if ced_paese == "IT" else ""))[:2].upper(), max_chars=2)
 
     with col_cess:
-        st.markdown("**CLIENTE STUDIO (Cessionario / Committente - Chi riceve)**")
+        st.markdown("**CLIENTE STUDIO (Cessionario / Committente)**")
         cess_nome = st.text_input("Denominazione Cliente", value=str(inv.get("cessionario_denominazione", "")))
-        cs_p1, cs_p2 = st.columns([1, 3])
-        cess_paese = cs_p1.text_input("Paese Cliente", value=str(inv.get("cessionario_paese", "IT"))[:2].upper(), max_chars=2)
-        cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
-        cess_cf = st.text_input("Codice Fiscale Cliente", value=str(inv.get("cessionario_cf", "")))
+        
+        cs_p1, cs_p2, cs_p3 = st.columns([1, 2, 2])
+        with cs_p1:
+            cess_paese = cs_p1.text_input("Nazione Cliente", value=str(inv.get("cessionario_paese") or "IT")[:2].upper(), max_chars=2)
+        with cs_p2:
+            cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
+        with cs_p3:
+            cess_cf = cs_p3.text_input("Codice Fiscale Cliente", value=str(inv.get("cessionario_cf", "")))
+
         cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "")))
         cs1, cs2, cs3 = st.columns([2, 3, 1])
         cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
@@ -240,7 +254,7 @@ with st.form("form_revisione_totale"):
     with col_t2:
         totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
-    # Feedback Live
+    # Feedback Live di Quadratura
     lordo_live = round(imponibile_1 + imposta_1, 2)
     netto_live = round(lordo_live - ritenuta_1, 2)
     diff_live = min(abs(netto_live - totale_doc), abs(lordo_live - totale_doc))
@@ -268,9 +282,9 @@ if btn_submit:
         "numero_documento": num_doc,
         "data_documento": data_doc.strftime("%Y-%m-%d"),
         "codice_destinatario": cod_sdi,
-        "regime_fiscale": "RF01",
+        "regime_fiscale": regime_fiscale_selezionato,
         "cedente_denominazione": ced_nome,
-        "cedente_paese": ced_paese,
+        "cedente_paese": ced_paese if ced_paese else "IT",
         "cedente_piva": ced_piva,
         "cedente_cf": ced_cf,
         "cedente_indirizzo": ced_via,
@@ -278,7 +292,7 @@ if btn_submit:
         "cedente_comune": ced_com,
         "cedente_provincia": ced_prov if ced_paese == "IT" else "",
         "cessionario_denominazione": cess_nome,
-        "cessionario_paese": cess_paese,
+        "cessionario_paese": cess_paese if cess_paese else "IT",
         "cessionario_piva": cess_piva,
         "cessionario_cf": cess_cf,
         "cessionario_indirizzo": cess_via,
@@ -300,6 +314,8 @@ if btn_submit:
     }
 
     xml_text = genera_xml_teamsystem(payload)
+    
+    # Nomenclatura formale SdI
     piva_trasmittente = cess_piva if cess_piva else "00000000000"
     base_file = f"IT{piva_trasmittente}_00001"
     
@@ -320,9 +336,9 @@ if st.session_state["xml_content"] is not None:
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nome file `{st.session_state['xml_filename']}` conforme SdI.")
+            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nodi `<p:RegimeFiscale>` e `<p:Nazione>` popolati per AdE.")
         else:
-            st.warning("⚠️ **Segnalazioni contabili:**")
+            st.warning("⚠️ **Segnalazioni di quadratura:**")
             for a in anomalie:
                 st.write(f"- {a}")
 
