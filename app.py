@@ -187,7 +187,6 @@ with st.form("form_revisione_totale"):
         with c_p3:
             ced_cf = st.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")))
 
-        # REGIME FISCALE ESPLICITO
         regime_fiscale_selezionato = st.selectbox(
             "Regime Fiscale Fornitore (Richiesto da AdE)",
             ["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato", "RF18 - Altro / Estero"],
@@ -254,7 +253,7 @@ with st.form("form_revisione_totale"):
     with col_t2:
         totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
-    # Feedback Live di Quadratura
+    # Feedback Live
     lordo_live = round(imponibile_1 + imposta_1, 2)
     netto_live = round(lordo_live - ritenuta_1, 2)
     diff_live = min(abs(netto_live - totale_doc), abs(lordo_live - totale_doc))
@@ -336,7 +335,7 @@ if st.session_state["xml_content"] is not None:
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nodi `<p:RegimeFiscale>` e `<p:Nazione>` popolati per AdE.")
+            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: File generato con sintassi ministeriale certificata per AdE.")
         else:
             st.warning("⚠️ **Segnalazioni di quadratura:**")
             for a in anomalie:
@@ -349,17 +348,19 @@ if st.session_state["xml_content"] is not None:
             else:
                 st.warning(f"☁️ {g_msg}")
 
+    # Buffer ZIP
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"])
+        z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"].encode("utf-8"))
         uploaded_file.seek(0)
         z.writestr(uploaded_file.name, uploaded_file.read())
     zip_bytes.seek(0)
 
     with c2:
+        # Download con encoding esplicito utf-8
         st.download_button(
             "💾 Scarica XML (Nome Ufficiale SdI)",
-            data=st.session_state["xml_content"],
+            data=st.session_state["xml_content"].encode("utf-8"),
             file_name=st.session_state["xml_filename"],
             mime="application/xml",
             use_container_width=True
