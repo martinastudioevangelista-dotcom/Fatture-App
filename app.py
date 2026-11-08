@@ -1,4 +1,4 @@
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Conforme Agenzia Entrate & ECONS)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Supporto Completo PDF + XML + P7M)
 import io
 import zipfile
 import pandas as pd
@@ -20,12 +20,23 @@ def valida_partita_iva(piva: str, paese: str = "IT") -> bool:
         return ((10 - (s % 10)) % 10) == int(p[10])
     return 4 <= len(p) <= 15
 
-def valida_quadratura(riepilogo, totale, ritenuta=0.0):
-    tot_calc = sum(r["imponibile"] + r["imposta"] for r in riepilogo)
-    diff = min(abs(tot_calc - totale), abs((tot_calc - ritenuta) - totale))
-    errs = [f"Differenza totale calcolato ({tot_calc:.2f}€ lordo / {tot_calc - ritenuta:.2f}€ netto) vs dichiarato ({totale:.2f}€)"] if diff > 0.05 else []
-    return (len(errs) == 0), errs
+def valida_quadratura_fiscale(riepilogo, totale, ritenuta=0.0):
+    tot_imp = sum(r["imponibile"] for r in riepilogo)
+    tot_iva = sum(r["imposta"] for r in riepilogo)
+    lordo_calcolato = round(tot_imp + tot_iva, 2)
+    netto_calcolato = round(lordo_calcolato - ritenuta, 2)
 
+    diff_netto = abs(netto_calcolato - totale)
+    diff_lordo = abs(lordo_calcolato - totale)
+
+    if diff_netto <= 0.02 or diff_lordo <= 0.02:
+        return True, []
+    
+    return False, [
+        f"Asimmetria: Calcolato Netto {netto_calcolato:.2f}€ (Lordo {lordo_calcolato:.2f}€) vs Dichiarato {totale:.2f}€."
+    ]
+
+# Moduli
 try:
     from extractor import estrai_dati_fattura
 except SyntaxError as e:
@@ -33,6 +44,12 @@ except SyntaxError as e:
     st.stop()
 except BaseException as e:
     st.error(f"❌ Errore in extractor.py: {e}")
+    st.stop()
+
+try:
+    from xml_reader import leggi_xml_fattura
+except Exception as e:
+    st.error(f"❌ Errore nel caricamento di xml_reader.py: {e}")
     st.stop()
 
 from xml_generator import genera_xml_teamsystem
@@ -62,23 +79,34 @@ with st.sidebar:
     salva_drive = st.checkbox("Archivia su Google Drive", value=True)
 
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Fatturazione FPR12 v1.2.2 - Supporto fatture passive (TD01), autofatture estere (TD17) e notule con ritenuta.")
+st.caption("Suite Integrata: Conversione PDF/Scansioni, Importazione XML/P7M e Riconciliazione Bancaria.")
 
 col_up1, col_up2 = st.columns([4, 1])
 with col_up1:
-    uploaded_file = st.file_uploader("Carica fattura (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
+    # Supporta sia PDF/immagini che file XML o XML firmati digitalmente (.p7m)
+    uploaded_file = st.file_uploader(
+        "Carica fattura (PDF, Immagine, XML nativo o firmato .P7M)", 
+        type=["pdf", "png", "jpg", "jpeg", "xml", "p7m"]
+    )
 with col_up2:
     st.write("")
     st.write("")
-    force_reparse = st.button("🔄 Rianalizza Documento", help="Forza una nuova lettura completa del file.")
+    force_reparse = st.button("🔄 Rianalizza Documento", help="Rilegge il file azzerando la cache.")
 
 if uploaded_file is not None:
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state["last_file_id"] != file_id or force_reparse:
-        with st.status("Elaborazione multi-pagina e quadratura contabile...", expanded=True) as status:
+        nome_file = uploaded_file.name.lower()
+        
+        with st.status("Acquisizione e quadratura del documento...", expanded=True) as status:
             file_bytes = uploaded_file.read()
             uploaded_file.seek(0)
-            dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
+            
+            # BIFORCAZIONE: Se è XML o P7M usa xml_reader, altrimenti usa extractor PDF/Image
+            if nome_file.endswith(".xml") or nome_file.endswith(".p7m"):
+                dati, motore, testo_raw, err_ai = leggi_xml_fattura(file_bytes, uploaded_file.name)
+            else:
+                dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
             
             st.session_state["invoice_data"] = dati
             st.session_state["motore_usato"] = motore
@@ -88,17 +116,17 @@ if uploaded_file is not None:
             st.session_state["xml_content"] = None
             st.session_state["xml_filename"] = None
             st.session_state["validation_report"] = None
-            status.update(label=f"✅ Analisi completata: {motore}", state="complete", expanded=False)
+            status.update(label=f"✅ Acquisizione completata: {motore}", state="complete", expanded=False)
         st.rerun()
 
 if st.session_state["invoice_data"] is None:
-    st.info("👆 Carica una fattura per iniziare.")
+    st.info("👆 Carica un PDF o un file XML/P7M per visualizzare i dati.")
     st.stop()
 
 inv = st.session_state["invoice_data"]
 
 if st.session_state.get("errore_ai"):
-    st.warning(f"⚠️ Avviso Motore AI: {st.session_state['errore_ai']}")
+    st.warning(f"⚠️ Avviso: {st.session_state['errore_ai']}")
 
 st.markdown("### 🔍 Verifica Soggetti Estratti (Human-in-the-Loop)")
 df_rep = pd.DataFrame([
@@ -161,7 +189,7 @@ with st.form("form_revisione_totale"):
         ci1, ci2, ci3 = st.columns([2, 3, 1])
         ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
         ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
-        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2, help="Lasciare vuoto per fornitori esteri")
+        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM"))[:2].upper(), max_chars=2)
 
     with col_cess:
         st.markdown("**CLIENTE STUDIO (Cessionario / Committente - Chi riceve)**")
@@ -212,6 +240,16 @@ with st.form("form_revisione_totale"):
     with col_t2:
         totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
+    # Feedback Live
+    lordo_live = round(imponibile_1 + imposta_1, 2)
+    netto_live = round(lordo_live - ritenuta_1, 2)
+    diff_live = min(abs(netto_live - totale_doc), abs(lordo_live - totale_doc))
+
+    if diff_live <= 0.02:
+        st.success(f"🟢 **Quadratura Verificata**: {imponibile_1:.2f}€ + {imposta_1:.2f}€" + (f" - {ritenuta_1:.2f}€" if ritenuta_1 > 0 else "") + f" = {totale_doc:.2f}€")
+    else:
+        st.warning(f"🟡 **Scostamento**: Netto calcolato {netto_live:.2f}€ vs inserito {totale_doc:.2f}€")
+
     btn_submit = st.form_submit_button("✅ Conferma Dati e Genera XML Conforme SdI / TeamSystem", type="primary", use_container_width=True)
 
 if btn_submit:
@@ -222,7 +260,7 @@ if btn_submit:
     if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
         segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
 
-    quadratura_ok, errs = valida_quadratura(righe_iva, totale_doc, ritenuta=ritenuta_1)
+    quadratura_ok, errs = valida_quadratura_fiscale(righe_iva, totale_doc, ritenuta=ritenuta_1)
     st.session_state["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
 
     payload = {
@@ -262,9 +300,6 @@ if btn_submit:
     }
 
     xml_text = genera_xml_teamsystem(payload)
-    
-    # RECOLA NOMENCLATURA UFFICIALE AGENZIA DELLE ENTRATE:
-    # IT + P.IVA Trasmittente (Cliente Studio) + _ + Progressivo 5 caratteri
     piva_trasmittente = cess_piva if cess_piva else "00000000000"
     base_file = f"IT{piva_trasmittente}_00001"
     
@@ -285,9 +320,9 @@ if st.session_state["xml_content"] is not None:
     c1, c2 = st.columns([2, 1])
     with c1:
         if is_ok:
-            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nome file `{st.session_state['xml_filename']}` conforme alle regole SdI.")
+            st.success(f"✅ **Tracciato Conforme FatturaPA 1.2.2**: Nome file `{st.session_state['xml_filename']}` conforme SdI.")
         else:
-            st.warning("⚠️ **Segnalazioni di quadratura:**")
+            st.warning("⚠️ **Segnalazioni contabili:**")
             for a in anomalie:
                 st.write(f"- {a}")
 
