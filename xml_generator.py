@@ -48,36 +48,49 @@ def genera_xml_teamsystem(data):
     tipo_doc = str(data.get("tipo_documento") or "TD01")
     descrizione = _esc(data.get("descrizione"), "Fornitura / Canone leasing")
 
-    # 4. Importi e Contabilita
+    # 4. Quadratura Matematica Rigida per Schematron AdE (Regola 'Imposta')
     try:
-        imponibile = float(data.get("imponibile", 0.0) or 0.0)
+        imponibile = round(float(data.get("imponibile", 0.0) or 0.0), 2)
     except (ValueError, TypeError):
         imponibile = 0.0
 
     try:
-        aliquota = float(data.get("aliquota_iva", 0.0) or 0.0)
+        aliquota = round(float(data.get("aliquota_iva", 0.0) or 0.0), 2)
     except (ValueError, TypeError):
         aliquota = 0.0
 
     try:
-        imposta = float(data.get("imposta", 0.0) or 0.0)
+        imposta_in = float(data.get("imposta", 0.0) or 0.0)
     except (ValueError, TypeError):
-        imposta = 0.0
+        imposta_in = 0.0
+
+    # RISOLUZIONE REGOLA 'Imposta':
+    if aliquota == 0.0:
+        # Se aliquota è 0, Imposta DEVE essere tassativamente 0.00
+        imposta = 0.00
+    else:
+        # Se aliquota > 0, ricalcola al centesimo per rispettare la tolleranza legale
+        imposta_attesa = round((imponibile * aliquota) / 100.0, 2)
+        if imposta_in == 0.0 or abs(imposta_in - imposta_attesa) > 0.02:
+            imposta = imposta_attesa
+        else:
+            imposta = round(imposta_in, 2)
 
     totale = round(imponibile + imposta, 2)
-    if data.get("totale") is not None:
-        try:
-            totale = float(data.get("totale"))
-        except (ValueError, TypeError):
-            pass
 
-    # Natura IVA (obbligatoria se aliquota 0%)
+    # Natura IVA e Riferimento Normativo (obbligatori se aliquota 0%)
     natura_tag = ""
     natura_riepilogo = ""
     if aliquota == 0.0:
-        nat_val = str(data.get("natura") or ("N3.2" if forn_paese != "IT" else "N2.2"))
+        nat_val = str(data.get("natura") or ("N3.2" if forn_paese != "IT" else "N2.2")).strip()
+        if not nat_val:
+            nat_val = "N3.2" if forn_paese != "IT" else "N2.2"
         natura_tag = f"\n        <Natura>{nat_val}</Natura>"
-        natura_riepilogo = f"\n      <Natura>{nat_val}</Natura>"
+        ref_normativo = "Operazione non imponibile art. 41" if nat_val == "N3.2" else "Operazione non soggetta"
+        natura_riepilogo = (
+            f"\n      <Natura>{nat_val}</Natura>"
+            f"\n      <RiferimentoNormativo>{ref_normativo}</RiferimentoNormativo>"
+        )
 
     # 5. Sezione CONSPAY TeamSystem (Dati Pagamento)
     iban_clean = re.sub(r"[^A-Za-z0-9]", "", str(data.get("iban", ""))).upper()
@@ -85,7 +98,7 @@ def genera_xml_teamsystem(data):
     scadenza_pag = str(data.get("scadenza") or data_doc)
     metodo_pag = str(data.get("metodo_pagamento") or "MP05")
 
-    # Costruzione XML con <DatiBeniServizi> ufficiale ministeriale
+    # Tracciato XML Formale Validato
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<FatturaElettronica versione="FPR12" xmlns="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2">',
