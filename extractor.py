@@ -1,10 +1,7 @@
 """
 extractor.py
-Motore di Estrazione Fiscale Multi-Layout a 4 Vie:
-1. Foglio di stile SdI (vettoriale e scansioni, es. Antonio Ferraiuolo -> Casazen)
-2. Fatture in Cloud
-3. Commerciali classiche & Proforma con Ritenuta
-4. Fornitori Esteri UE (CGI Finance, SGB Finance)
+Motore di Estrazione Fiscale Multi-Layout a 4 Vie compatibile con app.py:
+Restituisce: (dati, motore, testo_raw, err_ai)
 """
 
 import io
@@ -13,8 +10,7 @@ from datetime import datetime
 
 
 def _estrai_testo_da_pdf(file_input) -> str:
-    """Estrae tutto il testo dal PDF provando in sequenza pypdf, pdfplumber o PyMuPDF."""
-    # Normalizzazione input in bytes
+    """Estrae tutto il testo dal PDF provando in sequenza pypdf, pdfplumber o fitz."""
     if hasattr(file_input, "read"):
         file_input.seek(0)
         pdf_bytes = file_input.read()
@@ -72,7 +68,6 @@ def _estrai_testo_da_pdf(file_input) -> str:
     except Exception:
         pass
 
-    # Fallback su decodifica stringa diretta
     try:
         return pdf_bytes.decode("utf-8", errors="ignore")
     except Exception:
@@ -80,11 +75,10 @@ def _estrai_testo_da_pdf(file_input) -> str:
 
 
 def _pulisci_importo(val_str: str) -> float:
-    """Converte stringhe contabili (con virgole, punti o spazi) in float puro."""
+    """Converte formati contabili italiani/europei in float."""
     if not val_str:
         return 0.0
     pulito = str(val_str).replace("€", "").replace("EUR", "").strip()
-    # Se ha il formato italiano 1.250,50
     if "." in pulito and "," in pulito:
         pulito = pulito.replace(".", "").replace(",", ".")
     elif "," in pulito:
@@ -96,10 +90,9 @@ def _pulisci_importo(val_str: str) -> float:
 
 
 def _estrai_foglio_stile_sdi(testo: str) -> dict:
-    """Parser specializzato per il layout standard ministeriale Foglio di Stile SdI."""
+    """Parser per il foglio di stile ministeriale SdI (es. Antonio Ferraiuolo -> Casazen s.r.l.)."""
     dati = {}
 
-    # 1. Suddivisione delle macro-sezioni
     blocco_cedente = ""
     blocco_cessionario = ""
     blocco_generale = ""
@@ -136,10 +129,7 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
     if m_pag:
         blocco_pagamento = m_pag.group(1)
 
-    # -------------------------------------------------------------
-    # 2. CEDENTE / PRESTATORE (Fornitore)
-    # -------------------------------------------------------------
-    # Persona fisica (Nome + Cognome come Antonio Ferraiuolo)
+    # 1. FORNITORE (CEDENTE): gestisce persone fisiche (Nome + Cognome) o società (Denominazione)
     m_nome = re.search(r"Nome:\s*([^\n\r]+)", blocco_cedente, re.IGNORECASE)
     m_cognome = re.search(
         r"Cognome:\s*([^\n\r]+)", blocco_cedente, re.IGNORECASE
@@ -157,7 +147,6 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
     else:
         dati["fornitore_nome"] = "FORNITORE"
 
-    # P.IVA e CF Fornitore
     m_piva = re.search(
         r"Identificativo fiscale ai fini IVA:\s*(?:IT)?([A-Za-z0-9]+)",
         blocco_cedente,
@@ -169,7 +158,6 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
     if not dati["fornitore_piva"] and dati["fornitore_cf"]:
         dati["fornitore_piva"] = dati["fornitore_cf"]
 
-    # Sede Fornitore
     m_ind = re.search(r"Indirizzo:\s*([^\n\r]+)", blocco_cedente, re.IGNORECASE)
     dati["fornitore_indirizzo"] = m_ind.group(1).strip() if m_ind else ""
 
@@ -184,9 +172,7 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
         m_naz.group(1).strip().upper() if m_naz else "IT"
     )
 
-    # -------------------------------------------------------------
-    # 3. CESSIONARIO / COMMITTENTE (Cliente - es. Casazen)
-    # -------------------------------------------------------------
+    # 2. CLIENTE (CESSIONARIO): es. Casazen s.r.l.
     m_c_denom = re.search(
         r"Denominazione:\s*([^\n\r]+)", blocco_cessionario, re.IGNORECASE
     )
@@ -218,9 +204,7 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
     )
     dati["cliente_nazione"] = "IT"
 
-    # -------------------------------------------------------------
-    # 4. DATI GENERALI E CONTABILI
-    # -------------------------------------------------------------
+    # 3. DATI GENERALI E CONTABILITÀ
     m_num = re.search(
         r"Numero documento:\s*([^\n\r]+)", blocco_generale, re.IGNORECASE
     )
@@ -238,7 +222,6 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
     m_tipo = re.search(r"Tipologia documento:\s*(TD\d+)", blocco_generale)
     dati["tipo_documento"] = m_tipo.group(1).strip() if m_tipo else "TD01"
 
-    # Imponibile, Aliquota, Imposta e Totale
     m_imp = re.search(
         r"Totale imponibile/importo:\s*([\d\.,]+)", blocco_generale
     )
@@ -269,9 +252,7 @@ def _estrai_foglio_stile_sdi(testo: str) -> dict:
         else "Prestazione professionale / Servizi"
     )
 
-    # -------------------------------------------------------------
-    # 5. DATI PAGAMENTO E CONSPAY
-    # -------------------------------------------------------------
+    # 4. PAGAMENTO E CONSPAY
     m_iban = re.search(r"Codice IBAN:\s*([A-Z0-9]+)", blocco_pagamento)
     dati["iban"] = m_iban.group(1).strip() if m_iban else ""
 
@@ -317,7 +298,6 @@ def _estrai_fornitore_estero(testo: str) -> dict:
     dati["aliquota_iva"] = 0.00
     dati["natura"] = "N3.2"
 
-    # Estrazione importo
     m_imp = re.search(
         r"(?:TOTAL|MONTANT|IMPORTO|TOTALE)[^\d\n\r]*([\d\.,]+)", testo_upper
     )
@@ -328,7 +308,6 @@ def _estrai_fornitore_estero(testo: str) -> dict:
     dati["ritenuta"] = 0.00
     dati["descrizione"] = "Canone leasing nautico / fornitura estera"
 
-    # IBAN se presente
     m_iban = re.search(r"([A-Z]{2}\d{2}[A-Z0-9]{11,30})", testo)
     dati["iban"] = m_iban.group(1).strip() if m_iban else ""
     dati["metodo_pagamento"] = "MP05"
@@ -338,34 +317,43 @@ def _estrai_fornitore_estero(testo: str) -> dict:
     return dati
 
 
-def estrai_dati_fattura(file_input) -> dict:
-    """FUNZIONE PRINCIPALE ATTESA DA APP.PY:
+def estrai_dati_fattura(file_input, file_name="", api_key=None, **kwargs):
+    """FUNZIONE PRINCIPALE COMPATIBILE CON APP.PY:
 
-    Riceve il file PDF (o i bytes) e restituisce il dizionario con tutti i dati fiscali.
+    Accetta: (file_bytes, file_name, api_key=api_key)
+    Restituisce: (dati, motore, testo_raw, err_ai)
     """
-    testo = _estrai_testo_da_pdf(file_input)
+    testo_raw = _estrai_testo_da_pdf(file_input)
+    motore = "Regex Deterministiche"
+    err_ai = None
 
-    # 1. Se è un Foglio di Stile SdI (Ministeriale)
+    # 1. Riconoscimento Foglio di Stile SdI (Antonio Ferraiuolo, Casazen, ecc.)
     if (
-        "Dati del cedente" in testo
-        or "Fattura Elettronica" in testo
-        or "foglio di stile" in testo.lower()
+        "Dati del cedente" in testo_raw
+        or "Fattura Elettronica" in testo_raw
+        or "foglio di stile" in testo_raw.lower()
     ):
-        return _estrai_foglio_stile_sdi(testo)
+        dati = _estrai_foglio_stile_sdi(testo_raw)
+        motore = "Foglio di Stile SdI (Ministeriale)"
+        return dati, motore, testo_raw, err_ai
 
-    # 2. Se è un fornitore estero (CGI o SGB)
+    # 2. Riconoscimento Fornitore Estero (CGI Finance / SGB Finance)
     if (
-        "CGI FINANCE" in testo.upper()
-        or "SGB FINANCE" in testo.upper()
-        or "MARCQ EN BAROEUL" in testo.upper()
+        "CGI FINANCE" in testo_raw.upper()
+        or "SGB FINANCE" in testo_raw.upper()
+        or "MARCQ EN BAROEUL" in testo_raw.upper()
     ):
-        return _estrai_fornitore_estero(testo)
+        dati = _estrai_fornitore_estero(testo_raw)
+        motore = "Fornitore Estero UE (CGI / SGB)"
+        return dati, motore, testo_raw, err_ai
 
-    # 3. Layout generico commerciale (Fallback)
-    return _estrai_foglio_stile_sdi(testo)
+    # 3. Fallback: Prova comunque con Foglio di Stile SdI
+    dati = _estrai_foglio_stile_sdi(testo_raw)
+    motore = "Heuristic Engine"
+    return dati, motore, testo_raw, err_ai
 
 
-# Alias per evitare qualsiasi futuro errore di import
+# Alias di compatibilità
 extract_invoice_data = estrai_dati_fattura
 estrai_fattura = estrai_dati_fattura
 estrai_dati = estrai_dati_fattura
