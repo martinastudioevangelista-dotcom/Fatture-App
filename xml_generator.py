@@ -85,7 +85,7 @@ def genera_xml_teamsystem(data):
     scadenza_pag = str(data.get("scadenza") or data_doc)
     metodo_pag = str(data.get("metodo_pagamento") or "MP05")
 
-    # Costruzione XML universale conforme a SdI e TeamSystem
+    # Costruzione XML con <DatiBeniServizi> ufficiale ministeriale
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<FatturaElettronica versione="FPR12" xmlns="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2">',
@@ -145,7 +145,7 @@ def genera_xml_teamsystem(data):
         f"        <ImportoTotaleDocumento>{totale:.2f}</ImportoTotaleDocumento>",
         "      </DatiGeneraliDocumento>",
         "    </DatiGenerali>",
-        "    <BeniServizi>",
+        "    <DatiBeniServizi>",
         "      <DettaglioLinee>",
         "        <NumeroLinea>1</NumeroLinea>",
         f"        <Descrizione>{descrizione}</Descrizione>",
@@ -158,7 +158,7 @@ def genera_xml_teamsystem(data):
         f"        <ImponibileImporto>{imponibile:.2f}</ImponibileImporto>",
         f"        <Imposta>{imposta:.2f}</Imposta>",
         "      </DatiRiepilogo>",
-        "    </BeniServizi>",
+        "    </DatiBeniServizi>",
         "    <DatiPagamento>",
         "      <CondizioniPagamento>TP02</CondizioniPagamento>",
         "      <DettaglioPagamento>",
@@ -173,6 +173,6 @@ def genera_xml_teamsystem(data):
     return "\n".join(xml_lines)
 
 
-# Alias di sicurezza
+# Alias di compatibilità
 generate_sdi_xml = genera_xml_teamsystem
 genera_xml = genera_xml_teamsystem
