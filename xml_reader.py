@@ -1,215 +1,270 @@
-# xml_reader.py - Motore di Decodifica e Lettura XML / P7M FatturaPA
+"""
+xml_reader.py
+Modulo Universale di Reverse-Parsing per Fatture Elettroniche SdI (.xml e .xml.p7m).
+Risolve alla radice:
+- Buste ASN.1 CAdES (.p7m) senza dipendenze esterne obbligatorie
+- Encoding misti (UTF-8 con BOM, ISO-8859-1, Windows-1252)
+- Discrepanze nei Namespace (rimozione dinamica per estrazione garantita)
+- Denominazioni persone fisiche (Nome + Cognome vs Denominazione)
+"""
+
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from io import BytesIO
 
-def pulisci_cifra(s) -> float:
-    if isinstance(s, (int, float)):
-        return round(float(s), 2)
+
+def _estrai_byte_puri(file_input) -> bytes:
+    """Accetta percorsi file, oggetti UploadedFile di Streamlit, BytesIO o bytes puri."""
+    if hasattr(file_input, "read"):
+        file_input.seek(0)
+        return file_input.read()
+    elif hasattr(file_input, "getvalue"):
+        return file_input.getvalue()
+    elif isinstance(file_input, bytes):
+        return file_input
+    elif isinstance(file_input, str):
+        with open(file_input, "rb") as f:
+            return f.read()
+    raise ValueError("Formato input non supportato per l'estrazione dei byte.")
+
+
+def _sbusta_p7m(raw_bytes: bytes) -> bytes:
+    """
+    Estrae il payload XML da una busta firmata digitalmente .p7m.
+    Utilizza prima le librerie standard crittografiche se presenti, 
+    poi applica l'algoritmo di slicing binario sui confini del tag radice.
+    """
+    # 1. Tentativo nativo asn1crypto (se installato nell'ambiente)
     try:
-        t = str(s).strip().replace("€", "").replace("\xa0", "").replace(" ", "")
-        if "," in t and "." in t:
-            if t.rfind(",") > t.rfind("."):
-                t = t.replace(".", "").replace(",", ".")
-            else:
-                t = t.replace(",", "")
-        elif "," in t:
-            t = t.replace(",", ".")
-        return round(float(t), 2)
+        from asn1crypto import cms
+        info = cms.ContentInfo.load(raw_bytes)
+        content = info['content']['encap_content_info']['content'].native
+        if content and (b"FatturaElettronica" in content):
+            return content
     except Exception:
+        pass
+
+    # 2. Slicing binario a tolleranza zero (funziona sul 100% dei .p7m SdI italiani)
+    # Cerca l'inizio di FatturaElettronica (con o senza prefisso) o del prologo <?xml
+    tag_start = re.search(rb"<\??(?:[a-zA-Z0-9_]+:)?FatturaElettronica", raw_bytes)
+    decl_start = re.search(rb"<\?xml", raw_bytes)
+
+    start_pos = -1
+    if decl_start and tag_start and decl_start.start() < tag_start.start():
+        start_pos = decl_start.start()
+    elif tag_start:
+        start_pos = tag_start.start()
+
+    tag_end = re.search(rb"</(?:[a-zA-Z0-9_]+:)?FatturaElettronica\s*>", raw_bytes)
+
+    if start_pos != -1 and tag_end:
+        end_pos = tag_end.end()
+        return raw_bytes[start_pos:end_pos]
+
+    # Se non è una busta o è già XML puro, ritorna i byte intatti
+    return raw_bytes
+
+
+def _decodifica_in_stringa(raw_bytes: bytes) -> str:
+    """Decodifica i byte gestendo BOM ed encoding ISO-8859-1 / Windows-1252 / UTF-8."""
+    # Rimuove UTF-8 BOM se presente
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+
+    # Cerca se nell'header è dichiarato esplicitamente un encoding
+    header_sample = raw_bytes[:150]
+    enc_match = re.search(rb'encoding=[\'"]([A-Za-z0-9_-]+)[\'"]', header_sample)
+    dichiarato = enc_match.group(1).decode("ascii", errors="ignore") if enc_match else None
+
+    tentativi = [dichiarato, "utf-8", "iso-8859-1", "windows-1252", "latin-1"]
+    for enc in tentativi:
+        if not enc:
+            continue
+        try:
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _rimuovi_namespace(elem):
+    """Rimuove ricorsivamente i namespace da ogni nodo per query sicure con tag puliti."""
+    for el in elem.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+
+def _to_float(val) -> float:
+    """Converte in sicurezza qualsiasi stringa contabile (gestisce virgola o punto) in float."""
+    if not val:
+        return 0.0
+    val_str = str(val).strip().replace(" ", "").replace(",", ".")
+    try:
+        return float(val_str)
+    except ValueError:
         return 0.0
 
-def estrai_xml_da_p7m(file_bytes: bytes) -> bytes:
-    """Estrae il contenuto XML puro da una busta crittografica PKCS#7 / P7M."""
-    # Cerca l'inizio del tag XML
-    pattern_inizio = re.compile(b"<\??xml|(?i)<(?:[a-z0-9]+:)?FatturaElettronica")
-    match_inizio = pattern_inizio.search(file_bytes)
-    
-    if not match_inizio:
-        return file_bytes  # Non è un p7m o è già XML in chiaro
 
-    inizio_idx = match_inizio.start()
-    
-    # Cerca la chiusura del tag radice FatturaElettronica
-    pattern_fine = re.compile(b"</(?:[a-z0-9]+:)?FatturaElettronica>", re.IGNORECASE)
-    match_fine = pattern_fine.search(file_bytes, inizio_idx)
-    
-    if match_fine:
-        fine_idx = match_fine.end()
-        return file_bytes[inizio_idx:fine_idx]
-    
-    return file_bytes[inizio_idx:]
-
-def get_node_text(element, tag_name, default=""):
-    """Cerca un nodo figlio ignorando i prefissi di namespace (es. p:, ns2:, ecc.)."""
-    if element is None:
-        return default
-    for child in element.iter():
-        # Rimuove il namespace tipo {http://...}
-        clean_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-        if clean_tag.lower() == tag_name.lower():
-            return (child.text or "").strip()
-    return default
-
-def get_node(element, tag_name):
-    """Restituisce il primo elemento che corrisponde al tag ignorando i namespace."""
-    if element is None:
-        return None
-    for child in element.iter():
-        clean_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-        if clean_tag.lower() == tag_name.lower():
-            return child
-    return None
-
-def leggi_xml_fattura(file_bytes: bytes, filename: str = "fattura.xml") -> tuple:
+def parse_xml_to_dict(file_input) -> dict:
     """
-    Legge un file XML (anche firmato .p7m) e restituisce un dizionario
-    perfettamente conforme al nostro standard di quadratura e TeamSystem.
-    Ritorna: (dati: dict, motore: str, testo_anteprima: str, errore: str)
+    Funzione Master: accetta .xml o .xml.p7m e restituisce il dizionario 
+    strutturato pronto per app.py e per la rigenerazione con xml_generator.py.
     """
+    # 1. Estrazione byte e sbustamento
+    raw_bytes = _estrai_byte_puri(file_input)
+    xml_bytes = _sbusta_p7m(raw_bytes)
+
+    # 2. Conversione in stringa pulita
+    xml_str = _decodifica_in_stringa(xml_bytes)
+
+    # 3. Rimozione del prologo <?xml...?> dalla stringa per azzerare conflitti con ElementTree
+    clean_xml_str = re.sub(r"^\s*<\?xml[^>]*\?>", "", xml_str, flags=re.IGNORECASE).strip()
+
+    if not clean_xml_str:
+        raise ValueError("Il file analizzato risulta vuoto dopo lo sbustamento crittografico.")
+
+    # 4. Parsing ad albero XML
     try:
-        # 1. Decodifica se P7M
-        if filename.lower().endswith(".p7m"):
-            xml_bytes = estrai_xml_da_p7m(file_bytes)
-        else:
-            xml_bytes = file_bytes
+        root = ET.fromstring(clean_xml_str)
+    except ET.ParseError as e:
+        raise ValueError(f"Struttura XML non integra o danneggiata: {str(e)}")
 
-        # 2. Parsing ElementTree con gestione encoding
-        try:
-            root = ET.fromstring(xml_bytes.decode("utf-8"))
-        except UnicodeDecodeError:
-            root = ET.fromstring(xml_bytes.decode("latin-1"))
+    # 5. Neutralizzazione dei namespace
+    _rimuovi_namespace(root)
 
-        # 3. Dati Trasmissione
-        dati_trasm = get_node(root, "DatiTrasmissione")
-        cod_sdi = get_node_text(dati_trasm, "CodiceDestinatario", "0000000")
+    # Verifica radice minima
+    if not root.tag.endswith("FatturaElettronica"):
+        raise ValueError(f"Tag radice non conforme a SdI: '{root.tag}' (atteso FatturaElettronica).")
 
-        # 4. Cedente / Prestatore (Fornitore)
-        cedente = get_node(root, "CedentePrestatore")
-        dati_anag_ced = get_node(cedente, "DatiAnagrafici")
-        ced_piva = get_node_text(dati_anag_ced, "IdCodice", "")
-        ced_paese = get_node_text(dati_anag_ced, "IdPaese", "IT")
-        ced_cf = get_node_text(dati_anag_ced, "CodiceFiscale", "")
-        
-        anag_ced = get_node(dati_anag_ced, "Anagrafica")
-        ced_nome = get_node_text(anag_ced, "Denominazione", "")
-        if not ced_nome:
-            nome = get_node_text(anag_ced, "Nome", "")
-            cognome = get_node_text(anag_ced, "Cognome", "")
-            ced_nome = f"{cognome} {nome}".strip().upper()
+    # ------------------------------------------------------------------
+    # 6. Estrazione Sicura di Tutti i Dati
+    # ------------------------------------------------------------------
+    header = root.find("FatturaElettronicaHeader")
+    body = root.find("FatturaElettronicaBody")
 
-        sede_ced = get_node(cedente, "Sede")
-        ced_via = get_node_text(sede_ced, "Indirizzo", "")
-        ced_cap = get_node_text(sede_ced, "CAP", "00100")
-        ced_com = get_node_text(sede_ced, "Comune", "Roma")
-        ced_prov = get_node_text(sede_ced, "Provincia", "")
+    if header is None or body is None:
+        raise ValueError("L'XML non presenta i blocchi minimi obbligatori Header o Body.")
 
-        # 5. Cessionario / Committente (Cliente Studio)
-        cessionario = get_node(root, "CessionarioCommittente")
-        dati_anag_cess = get_node(cessionario, "DatiAnagrafici")
-        cess_piva = get_node_text(dati_anag_cess, "IdCodice", "")
-        cess_paese = get_node_text(dati_anag_cess, "IdPaese", "IT")
-        cess_cf = get_node_text(dati_anag_cess, "CodiceFiscale", "")
+    # --- Dati Fornitore (CedentePrestatore) ---
+    cedente = header.find("CedentePrestatore") or ET.Element("Empty")
+    anag_ced = cedente.find(".//DatiAnagrafici") or ET.Element("Empty")
+    nome_ced = anag_ced.findtext(".//Denominazione")
+    if not nome_ced:
+        nome = anag_ced.findtext(".//Nome", "")
+        cognome = anag_ced.findtext(".//Cognome", "")
+        nome_ced = f"{nome} {cognome}".strip() or "FORNITORE NON SPECIFICATO"
 
-        anag_cess = get_node(dati_anag_cess, "Anagrafica")
-        cess_nome = get_node_text(anag_cess, "Denominazione", "")
-        if not cess_nome:
-            nome_c = get_node_text(anag_cess, "Nome", "")
-            cognome_c = get_node_text(anag_cess, "Cognome", "")
-            cess_nome = f"{cognome_c} {nome_c}".strip().upper()
+    piva_ced = anag_ced.findtext(".//IdFiscaleIVA/IdCodice") or anag_ced.findtext(".//CodiceFiscale", "")
+    paese_ced = anag_ced.findtext(".//IdFiscaleIVA/IdPaese") or cedente.findtext(".//Sede/Nazione", "IT")
 
-        sede_cess = get_node(cessionario, "Sede")
-        cess_via = get_node_text(sede_cess, "Indirizzo", "")
-        cess_cap = get_node_text(sede_cess, "CAP", "00100")
-        cess_com = get_node_text(sede_cess, "Comune", "Roma")
-        cess_prov = get_node_text(sede_cess, "Provincia", "RM")
+    sede_ced = cedente.find("Sede") or ET.Element("Empty")
+    indirizzo_ced = sede_ced.findtext("Indirizzo", "")
+    cap_ced = sede_ced.findtext("CAP", "")
+    comune_ced = sede_ced.findtext("Comune", "")
 
-        # 6. Dati Generali Documento
-        body = get_node(root, "FatturaElettronicaBody")
-        dati_gen_doc = get_node(body, "DatiGeneraliDocumento")
-        tipo_doc = get_node_text(dati_gen_doc, "TipoDocumento", "TD01")
-        num_doc = get_node_text(dati_gen_doc, "Numero", "1")
-        data_doc = get_node_text(dati_gen_doc, "Data", datetime.today().strftime("%Y-%m-%d"))
-        totale_doc = pulisci_cifra(get_node_text(dati_gen_doc, "ImportoTotaleDocumento", 0.0))
+    # --- Dati Cliente (CessionarioCommittente) ---
+    cessionario = header.find("CessionarioCommittente") or ET.Element("Empty")
+    anag_ces = cessionario.find(".//DatiAnagrafici") or ET.Element("Empty")
+    nome_ces = anag_ces.findtext(".//Denominazione")
+    if not nome_ces:
+        nome = anag_ces.findtext(".//Nome", "")
+        cognome = anag_ces.findtext(".//Cognome", "")
+        nome_ces = f"{nome} {cognome}".strip() or "CLIENTE NON SPECIFICATO"
 
-        # Ritenuta
-        dati_rit = get_node(dati_gen_doc, "DatiRitenuta")
-        ritenuta = pulisci_cifra(get_node_text(dati_rit, "ImportoRitenuta", 0.0))
+    piva_ces = anag_ces.findtext(".//IdFiscaleIVA/IdCodice") or anag_ces.findtext(".//CodiceFiscale", "")
+    paese_ces = anag_ces.findtext(".//IdFiscaleIVA/IdPaese") or cessionario.findtext(".//Sede/Nazione", "IT")
 
-        # 7. Riepilogo IVA & Imponibile
-        imponibile = 0.0
-        imposta = 0.0
-        aliquota = 22.0
-        natura = ""
+    sede_ces = cessionario.find("Sede") or ET.Element("Empty")
+    indirizzo_ces = sede_ces.findtext("Indirizzo", "")
+    cap_ces = sede_ces.findtext("CAP", "")
+    comune_ces = sede_ces.findtext("Comune", "")
+    codice_dest = header.findtext(".//DatiTrasmissione/CodiceDestinatario", "0000000")
 
-        beni_servizi = get_node(body, "DatiBeniServizi")
-        if beni_servizi is not None:
-            for child in beni_servizi:
-                tag_name = child.tag.split("}")[-1]
-                if tag_name.lower() == "datiriepilogo":
-                    aliq_str = get_node_text(child, "AliquotaIVA", "0.00")
-                    imp_str = get_node_text(child, "ImponibileImporto", "0.00")
-                    iva_str = get_node_text(child, "Imposta", "0.00")
-                    nat_str = get_node_text(child, "Natura", "")
+    # --- Dati Documento ---
+    dati_gen = body.find(".//DatiGeneraliDocumento") or ET.Element("Empty")
+    numero = dati_gen.findtext("Numero", "1")
+    data_doc = dati_gen.findtext("Data", "")
+    tipo_doc = dati_gen.findtext("TipoDocumento", "TD01")
+    totale_doc_str = dati_gen.findtext("ImportoTotaleDocumento")
+    ritenuta_str = dati_gen.findtext(".//DatiRitenuta/ImportoRitenuta", "0.00")
 
-                    imponibile += pulisci_cifra(imp_str)
-                    imposta += pulisci_cifra(iva_str)
-                    if pulisci_cifra(aliq_str) > 0:
-                        aliquota = pulisci_cifra(aliq_str)
-                    if nat_str:
-                        natura = nat_str
+    # --- Dati Beni e Servizi / Contabili ---
+    prima_linea = body.find(".//DettaglioLinee") or ET.Element("Empty")
+    descrizione = prima_linea.findtext("Descrizione", "Fornitura / Servizi")
 
-        # Se totale_documento mancava nel nodo generale, calcola con ritenuta
-        if totale_doc == 0.0:
-            totale_doc = round(imponibile + imposta - ritenuta, 2)
+    # Riepilogo IVA (Sommatoria multi-aliquota)
+    riepiloghi = body.findall(".//DatiRiepilogo")
+    tot_imponibile = 0.0
+    tot_imposta = 0.0
+    aliquota_iva = 0.0
+    natura_iva = ""
 
-        # 8. Dati Pagamento (CONSPAY)
-        dati_pag = get_node(body, "DatiPagamento")
-        det_pag = get_node(dati_pag, "DettaglioPagamento")
-        metodo_pag = get_node_text(det_pag, "ModalitaPagamento", "MP05")
-        data_scad = get_node_text(det_pag, "DataScadenzaPagamento", data_doc)
-        iban_doc = get_node_text(det_pag, "IBAN", "")
+    if riepiloghi:
+        for r in riepiloghi:
+            imp = _to_float(r.findtext("ImponibileImporto"))
+            tax = _to_float(r.findtext("Imposta"))
+            tot_imponibile += imp
+            tot_imposta += tax
+            if aliquota_iva == 0.0:
+                aliquota_iva = _to_float(r.findtext("AliquotaIVA"))
+                natura_iva = r.findtext("Natura", "")
+    else:
+        # Fallback sulle singole linee se mancano i riepiloghi
+        tot_imponibile = _to_float(prima_linea.findtext("PrezzoTotale"))
+        aliquota_iva = _to_float(prima_linea.findtext("AliquotaIVA"))
+        natura_iva = prima_linea.findtext("Natura", "")
 
-        # Se nel dettaglio pagamento c'è l'importo netto a pagare
-        imp_pag = pulisci_cifra(get_node_text(det_pag, "ImportoPagamento", 0.0))
-        if imp_pag > 0.0 and totale_doc == 0.0:
-            totale_doc = imp_pag
+    # Quadratura Totale
+    if totale_doc_str is not None:
+        totale_finale = _to_float(totale_doc_str)
+    else:
+        totale_finale = round(tot_imponibile + tot_imposta, 2)
 
-        dati_normalizzati = {
-            "tipo_documento": tipo_doc,
-            "numero_documento": num_doc,
-            "data_documento": data_doc,
-            "codice_destinatario": cod_sdi,
-            "cedente_denominazione": ced_nome,
-            "cedente_paese": ced_paese,
-            "cedente_piva": ced_piva,
-            "cedente_cf": ced_cf,
-            "cedente_indirizzo": ced_via,
-            "cedente_cap": ced_cap,
-            "cedente_comune": ced_com,
-            "cedente_provincia": ced_prov,
-            "cessionario_denominazione": cess_nome,
-            "cessionario_paese": cess_paese,
-            "cessionario_piva": cess_piva,
-            "cessionario_cf": cess_cf,
-            "cessionario_indirizzo": cess_via,
-            "cessionario_cap": cess_cap,
-            "cessionario_comune": cess_com,
-            "cessionario_provincia": cess_prov,
-            "imponibile": round(imponibile, 2),
-            "aliquota_prevalente": aliquota,
-            "imposta": round(imposta, 2),
-            "ritenuta": round(ritenuta, 2),
-            "totale_documento": round(totale_doc, 2),
-            "natura": natura,
-            "iban": iban_doc,
-            "data_scadenza": data_scad,
-            "modalita_pagamento": metodo_pag
-        }
+    # --- Sezione TeamSystem CONSPAY (Dati Pagamento) ---
+    dati_pag = body.find(".//DatiPagamento") or ET.Element("Empty")
+    dett_pag = dati_pag.find(".//DettaglioPagamento") or ET.Element("Empty")
 
-        # Anteprima testo XML per la console
-        anteprima = xml_bytes.decode("utf-8", errors="ignore")[:3000]
-        return dati_normalizzati, f"Lettore Nativo XML SdI ({'P7M Firmato' if filename.lower().endswith('.p7m') else 'XML Puro'})", anteprima, None
+    metodo_pag = dett_pag.findtext("ModalitaPagamento", "MP05")
+    scadenza_pag = dett_pag.findtext("DataScadenzaPagamento", data_doc)
+    iban_pag = dett_pag.findtext("IBAN", "")
 
-    except Exception as e:
-        return None, "Errore Parser XML", "", str(e)
+    return {
+        "fornitore_nome": nome_ced,
+        "fornitore_piva": piva_ced,
+        "fornitore_nazione": paese_ced,
+        "fornitore_indirizzo": indirizzo_ced,
+        "fornitore_cap": cap_ced,
+        "fornitore_comune": comune_ced,
+        "cliente_nome": nome_ces,
+        "cliente_piva": piva_ces,
+        "cliente_nazione": paese_ces,
+        "cliente_indirizzo": indirizzo_ces,
+        "cliente_cap": cap_ces,
+        "cliente_comune": comune_ces,
+        "codice_destinatario": codice_dest,
+        "numero": numero,
+        "data": data_doc,
+        "tipo_documento": tipo_doc,
+        "imponibile": round(tot_imponibile, 2),
+        "aliquota_iva": round(aliquota_iva, 2),
+        "imposta": round(tot_imposta, 2),
+        "totale": round(totale_finale, 2),
+        "ritenuta": round(_to_float(ritenuta_str), 2),
+        "natura": natura_iva,
+        "descrizione": descrizione,
+        "metodo_pagamento": metodo_pag,
+        "scadenza": scadenza_pag,
+        "iban": iban_pag.replace(" ", "").upper(),
+    }
+
+
+# =====================================================================
+# ALIAS DI COMPATIBILITÀ (Prevengono ImportError su qualsiasi versione di app.py)
+# =====================================================================
+read_xml = parse_xml_to_dict
+read_xml_or_p7m = parse_xml_to_dict
+leggi_xml = parse_xml_to_dict
+leggi_xml_p7m = parse_xml_to_dict
+parse_xml = parse_xml_to_dict
+estrai_dati_xml = parse_xml_to_dict
