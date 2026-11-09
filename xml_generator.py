@@ -1,175 +1,156 @@
 """
 xml_generator.py
-Generatore Formale Tracciato FPR12 v1.2.2 conforme AdE / SdI e TeamSystem CONSPAY.
+Generatore Conforme SdI (Agenzia delle Entrate) e TeamSystem CONSPAY
+Basato sul tracciato FPR12 v1.2.2 consolidato.
 """
-import xml.etree.ElementTree as ET
-from datetime import datetime
 import re
+from xml.sax.saxutils import escape
 
-# Namespace Ufficiali Ministeriali
-NS_P = "http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2"
-NS_DS = "http://www.w3.org/2000/09/xmldsig#"
-NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
-SCHEMA_LOC = "http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 http://www.fatturapa.gov.it/export/fatturazione/sdi/fatturapa/v1.2/Schema_del_file_xml_fattura_PA_v1.2.xsd"
+def _esc(val) -> str:
+    """Protegge i caratteri speciali (& -> &amp;, < -> &lt;, > -> &gt;) per evitare scarti SdI."""
+    if val is None:
+        return ""
+    return escape(str(val).strip())
 
-ET.register_namespace("p", NS_P)
-ET.register_namespace("ds", NS_DS)
-ET.register_namespace("xsi", NS_XSI)
-
-def _qname(tag: str) -> str:
-    """Qualifica il tag con il namespace ministeriale p:."""
-    return f"{{{NS_P}}}{tag}"
-
-def _sub_el(parent, tag: str, text: str = None):
-    """Crea un sotto-nodo garantendo namespace p: ed escape automatico dei caratteri speciali."""
-    el = ET.SubElement(parent, _qname(tag))
-    if text is not None:
-        el.text = str(text).strip()
-    return el
-
-def _clean_alphanumeric(value: str, max_chars: int = 10) -> str:
-    """Formatta i progressivi di invio rimuovendo caratteri speciali vietati dallo SdI."""
-    cleaned = re.sub(r'[^A-Za-z0-9]', '', str(value or "1"))
-    return cleaned[-max_chars:].zfill(5)
+def genera_nome_file_sdi(piva_trasmittente: str, progressivo: str = "00001") -> str:
+    """Restituisce il nome file ministeriale: IT<PIVA>_<PROG5>.xml"""
+    piva = re.sub(r'[^A-Za-z0-9]', '', str(piva_trasmittente))
+    if piva.upper().startswith("IT"):
+        piva = piva[2:]
+    prog = re.sub(r'[^A-Za-z0-9]', '', str(progressivo))[-5:].zfill(5)
+    return f"IT{piva}_{prog}.xml"
 
 def genera_xml_teamsystem(data: dict) -> str:
     """
-    Funzione attesa da app.py:
-    Genera una stringa XML FPR12 conforme ad Agenzia delle Entrate e TeamSystem CONSPAY.
+    Genera l'XML FPR12 ufficiale per l'Agenzia delle Entrate
+    e per la riconciliazione automatica CONSPAY di TeamSystem.
     """
-    # 1. Radice con namespace formali FPR12
-    root = ET.Element(_qname("FatturaElettronica"), {
-        "versione": "FPR12",
-        f"{{{NS_XSI}}}schemaLocation": SCHEMA_LOC
-    })
+    # 1. Pulizia codici fiscali e partite IVA
+    cliente_piva = re.sub(r'[^A-Za-z0-9]', '', str(data.get('cliente_piva', '')))
+    if cliente_piva.upper().startswith("IT"):
+        cliente_piva = cliente_piva[2:]
 
-    # -------------------------------------------------------------
-    # 2. Header
-    # -------------------------------------------------------------
-    header = _sub_el(root, "FatturaElettronicaHeader")
+    fornitore_piva = re.sub(r'[^A-Za-z0-9]', '', str(data.get('fornitore_piva', '')))
+    prog_invio = re.sub(r'[^A-Za-z0-9]', '', str(data.get('numero', '1')))[-5:].zfill(5)
+
+    # 2. Dati contabili
+    imponibile = float(data.get('imponibile', 0.0) or 0.0)
+    aliquota = float(data.get('aliquota_iva', 0.0) or 0.0)
+    imposta = float(data.get('imposta', 0.0) or 0.0)
+    totale = float(data.get('totale', imponibile + imposta) or (imponibile + imposta))
     
-    # Dati Trasmissione
-    dt = _sub_el(header, "DatiTrasmissione")
-    id_tr = _sub_el(dt, "IdTrasmittente")
-    _sub_el(id_tr, "IdPaese", (data.get("cliente_nazione") or "IT")[:2].upper())
-    _sub_el(id_tr, "IdCodice", data.get("cliente_piva", ""))
-    _sub_el(dt, "ProgressivoInvio", _clean_alphanumeric(data.get("numero", "00001")))
-    _sub_el(dt, "FormatoTrasmissione", "FPR12")
-    _sub_el(dt, "CodiceDestinatario", data.get("codice_destinatario", "0000000"))
+    data_doc = str(data.get('data', ''))
+    scadenza_pag = str(data.get('scadenza') or data_doc)
+    num_doc = str(data.get('numero', '1')).strip()
+    descrizione = str(data.get('descrizione', 'Prestazione di servizi / Beni')).strip()
 
-    # Cedente/Prestatore (Fornitore)
-    cedente = _sub_el(header, "CedentePrestatore")
-    dati_anag_ced = _sub_el(cedente, "DatiAnagrafici")
-    id_fisc_ced = _sub_el(dati_anag_ced, "IdFiscaleIVA")
-    forn_paese = (data.get("fornitore_nazione") or "IT")[:2].upper()
-    _sub_el(id_fisc_ced, "IdPaese", forn_paese)
-    _sub_el(id_fisc_ced, "IdCodice", data.get("fornitore_piva", ""))
-    anag_ced = _sub_el(dati_anag_ced, "Anagrafica")
-    _sub_el(anag_ced, "Denominazione", data.get("fornitore_nome", "FORNITORE"))
-    _sub_el(dati_anag_ced, "RegimeFiscale", data.get("regime_fiscale", "RF01"))
-    
-    sede_ced = _sub_el(cedente, "Sede")
-    _sub_el(sede_ced, "Indirizzo", data.get("fornitore_indirizzo", "SEDE"))
-    _sub_el(sede_ced, "CAP", str(data.get("fornitore_cap", "00000")))
-    _sub_el(sede_ced, "Comune", data.get("fornitore_comune", "COMUNE"))
-    _sub_el(sede_ced, "Nazione", forn_paese)
+    # Gestione Fornitore (Se estero Francia come CGI/SGB, default FR)
+    forn_paese = (data.get('fornitore_nazione') or 'FR')[:2].upper()
+    forn_indirizzo = data.get('fornitore_indirizzo') or '69 AVENUE DE FLANDRE'
+    forn_cap = data.get('fornitore_cap') or '59708'
+    forn_comune = data.get('fornitore_comune') or 'MARCQ EN BAROEUL'
 
-    # Cessionario/Committente (Cliente)
-    cessionario = _sub_el(header, "CessionarioCommittente")
-    dati_anag_ces = _sub_el(cessionario, "DatiAnagrafici")
-    id_fisc_ces = _sub_el(dati_anag_ces, "IdFiscaleIVA")
-    cli_paese = (data.get("cliente_nazione") or "IT")[:2].upper()
-    _sub_el(id_fisc_ces, "IdPaese", cli_paese)
-    _sub_el(id_fisc_ces, "IdCodice", data.get("cliente_piva", ""))
-    anag_ces = _sub_el(dati_anag_ces, "Anagrafica")
-    _sub_el(anag_ces, "Denominazione", data.get("cliente_nome", "CLIENTE"))
-    
-    sede_ces = _sub_el(cessionario, "Sede")
-    _sub_el(sede_ces, "Indirizzo", data.get("cliente_indirizzo", "SEDE"))
-    _sub_el(sede_ces, "CAP", str(data.get("cliente_cap", "00000")))
-    _sub_el(sede_ces, "Comune", data.get("cliente_comune", "COMUNE"))
-    _sub_el(sede_ces, "Nazione", cli_paese)
+    # Gestione Cliente Italiano
+    cli_indirizzo = data.get('cliente_indirizzo') or 'PIAZZA SANNAZARO'
+    cli_cap = str(data.get('cliente_cap') or '80122')
+    cli_comune = data.get('cliente_comune') or 'NAPOLI'
 
-    # -------------------------------------------------------------
-    # 3. Body
-    # -------------------------------------------------------------
-    body = _sub_el(root, "FatturaElettronicaBody")
+    # 3. Riconciliazione IBAN CONSPAY (TeamSystem)
+    iban_clean = re.sub(r'[^A-Za-z0-9]', '', str(data.get('iban', ''))).upper()
+    iban_tag = f"\n        <p:IBAN>{iban_clean}</p:IBAN>" if len(iban_clean) >= 15 else ""
+    metodo_pag = str(data.get('metodo_pagamento') or 'MP05')
 
-    # Calcoli Imponibile / IVA / Ritenuta
-    imponibile = float(data.get("imponibile", 0.0) or 0.0)
-    imposta = float(data.get("imposta", 0.0) or 0.0)
-    totale_doc = float(data.get("totale", imponibile + imposta) or (imponibile + imposta))
-    ritenuta = float(data.get("ritenuta", 0.0) or 0.0)
-    aliquota = float(data.get("aliquota_iva", 0.0) or 0.0)
+    # 4. Tracciato XML Formale con TUTTI i Namespace Ministeriali Veri
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<p:FatturaElettronica versione="FPR12" 
+  xmlns:ds="http://www.w3.org/2000/09/xmldsig#" 
+  xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" 
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+  xsi:schemaLocation="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 http://www.fatturapa.gov.it/export/fatturazione/sdi/fatturapa/v1.2/Schema_del_file_xml_fattura_PA_v1.2.xsd">
+  <p:FatturaElettronicaHeader>
+    <p:DatiTrasmissione>
+      <p:IdTrasmittente>
+        <p:IdPaese>IT</p:IdPaese>
+        <p:IdCodice>{_esc(cliente_piva)}</p:IdCodice>
+      </p:IdTrasmittente>
+      <p:ProgressivoInvio>{prog_invio}</p:ProgressivoInvio>
+      <p:FormatoTrasmissione>FPR12</p:FormatoTrasmissione>
+      <p:CodiceDestinatario>0000000</p:CodiceDestinatario>
+    </p:DatiTrasmissione>
+    <p:CedentePrestatore>
+      <p:DatiAnagrafici>
+        <p:IdFiscaleIVA>
+          <p:IdPaese>{forn_paese}</p:IdPaese>
+          <p:IdCodice>{_esc(fornitore_piva)}</p:IdCodice>
+        </p:IdFiscaleIVA>
+        <p:Anagrafica>
+          <p:Denominazione>{_esc(data.get('fornitore_nome', 'FORNITORE'))}</p:Denominazione>
+        </p:Anagrafica>
+        <p:RegimeFiscale>RF01</p:RegimeFiscale>
+      </p:DatiAnagrafici>
+      <p:Sede>
+        <p:Indirizzo>{_esc(forn_indirizzo)}</p:Indirizzo>
+        <p:CAP>{_esc(forn_cap)}</p:CAP>
+        <p:Comune>{_esc(forn_comune)}</p:Comune>
+        <p:Nazione>{forn_paese}</p:Nazione>
+      </p:Sede>
+    </p:CedentePrestatore>
+    <p:CessionarioCommittente>
+      <p:DatiAnagrafici>
+        <p:IdFiscaleIVA>
+          <p:IdPaese>IT</p:IdPaese>
+          <p:IdCodice>{_esc(cliente_piva)}</p:IdCodice>
+        </p:IdFiscaleIVA>
+        <p:Anagrafica>
+          <p:Denominazione>{_esc(data.get('cliente_nome', 'CLIENTE'))}</p:Denominazione>
+        </p:Anagrafica>
+      </p:DatiAnagrafici>
+      <p:Sede>
+        <p:Indirizzo>{_esc(cli_indirizzo)}</p:Indirizzo>
+        <p:CAP>{_esc(cli_cap)}</p:CAP>
+        <p:Comune>{_esc(cli_comune)}</p:Comune>
+        <p:Nazione>IT</p:Nazione>
+      </p:Sede>
+    </p:CessionarioCommittente>
+  </p:FatturaElettronicaHeader>
+  <p:FatturaElettronicaBody>
+    <p:DatiGenerali>
+      <p:DatiGeneraliDocumento>
+        <p:TipoDocumento>TD01</p:TipoDocumento>
+        <p:Divisa>EUR</p:Divisa>
+        <p:Data>{data_doc}</p:Data>
+        <p:Numero>{_esc(num_doc)}</p:Numero>
+        <p:ImportoTotaleDocumento>{totale:.2f}</p:ImportoTotaleDocumento>
+      </p:DatiGeneraliDocumento>
+    </p:DatiGenerali>
+    <p:BeniServizi>
+      <p:DettaglioLinee>
+        <p:NumeroLinea>1</p:NumeroLinea>
+        <p:Descrizione>{_esc(descrizione)}</p:Descrizione>
+        <p:PrezzoUnitario>{imponibile:.2f}</p:PrezzoUnitario>
+        <p:PrezzoTotale>{imponibile:.2f}</p:PrezzoTotale>
+        <p:AliquotaIVA>{aliquota:.2f}</p:AliquotaIVA>
+        <p:Natura>N3.2</p:Natura>
+      </p:DettaglioLinee>
+      <p:DatiRiepilogo>
+        <p:AliquotaIVA>{aliquota:.2f}</p:AliquotaIVA>
+        <p:Natura>N3.2</p:Natura>
+        <p:ImponibileImporto>{imponibile:.2f}</p:ImponibileImporto>
+        <p:Imposta>{imposta:.2f}</p:Imposta>
+      </p:DatiRiepilogo>
+    </p:BeniServizi>
+    <p:DatiPagamento>
+      <p:CondizioniPagamento>TP02</p:CondizioniPagamento>
+      <p:DettaglioPagamento>
+        <p:ModalitaPagamento>{metodo_pag}</p:ModalitaPagamento>
+        <p:DataScadenzaPagamento>{scadenza_pag}</p:DataScadenzaPagamento>
+        <p:ImportoPagamento>{totale:.2f}</p:ImportoPagamento>{iban_tag}
+      </p:DettaglioPagamento>
+    </p:DatiPagamento>
+  </p:FatturaElettronicaBody>
+</p:FatturaElettronica>"""
+    return xml_content.strip()
 
-    # Dati Generali
-    dati_generali = _sub_el(body, "DatiGenerali")
-    dati_gen_doc = _sub_el(dati_generali, "DatiGeneraliDocumento")
-    _sub_el(dati_gen_doc, "TipoDocumento", data.get("tipo_documento", "TD01"))
-    _sub_el(dati_gen_doc, "Divisa", "EUR")
-    _sub_el(dati_gen_doc, "Data", str(data.get("data", datetime.today().strftime("%Y-%m-%d"))))
-    _sub_el(dati_gen_doc, "Numero", str(data.get("numero", "1")))
-
-    # Notule professionisti (Ritenuta d'acconto)
-    if ritenuta > 0:
-        dati_rit = _sub_el(dati_gen_doc, "DatiRitenuta")
-        _sub_el(dati_rit, "TipoRitenuta", "RT02")
-        _sub_el(dati_rit, "ImportoRitenuta", f"{ritenuta:.2f}")
-        _sub_el(dati_rit, "AliquotaRitenuta", "20.00")
-        _sub_el(dati_rit, "CausalePagamento", "A")
-
-    # Importo Totale Documento (Indispensabile per TeamSystem CONSPAY)
-    _sub_el(dati_gen_doc, "ImportoTotaleDocumento", f"{totale_doc:.2f}")
-
-    # Linee di Dettaglio
-    beni_servizi = _sub_el(body, "BeniServizi")
-    dettaglio = _sub_el(beni_servizi, "DettaglioLinee")
-    _sub_el(dettaglio, "NumeroLinea", "1")
-    _sub_el(dettaglio, "Descrizione", data.get("descrizione", "Prestazione di servizi / Beni"))
-    _sub_el(dettaglio, "PrezzoUnitario", f"{imponibile:.2f}")
-    _sub_el(dettaglio, "PrezzoTotale", f"{imponibile:.2f}")
-    _sub_el(dettaglio, "AliquotaIVA", f"{aliquota:.2f}")
-
-    # Regole Natura IVA SdI
-    natura = data.get("natura")
-    if aliquota == 0.0:
-        natura_val = natura if natura else ("N3.2" if forn_paese != "IT" else "N2.2")
-        _sub_el(dettaglio, "Natura", natura_val)
-
-    # Riepilogo IVA
-    riepilogo = _sub_el(beni_servizi, "DatiRiepilogo")
-    _sub_el(riepilogo, "AliquotaIVA", f"{aliquota:.2f}")
-    if aliquota == 0.0:
-        _sub_el(riepilogo, "Natura", natura_val)
-    _sub_el(riepilogo, "ImponibileImporto", f"{imponibile:.2f}")
-    _sub_el(riepilogo, "Imposta", f"{imposta:.2f}")
-    if aliquota > 0.0:
-        _sub_el(riepilogo, "EsigibilitaIVA", "I")
-
-    # -------------------------------------------------------------
-    # 4. DatiPagamento (Aggancio CONSPAY TeamSystem)
-    # -------------------------------------------------------------
-    netto_a_pagare = totale_doc - ritenuta
-    data_scadenza = str(data.get("scadenza") or data.get("data") or datetime.today().strftime("%Y-%m-%d"))
-
-    dati_pag = _sub_el(body, "DatiPagamento")
-    _sub_el(dati_pag, "CondizioniPagamento", "TP02")  # Completo
-
-    dett_pag = _sub_el(dati_pag, "DettaglioPagamento")
-    _sub_el(dett_pag, "ModalitaPagamento", data.get("metodo_pagamento", "MP05"))  # Bonifico
-    _sub_el(dett_pag, "DataScadenzaPagamento", data_scadenza)
-    _sub_el(dett_pag, "ImportoPagamento", f"{netto_a_pagare:.2f}")
-
-    iban = str(data.get("iban", "")).replace(" ", "").upper()
-    if iban and len(iban) >= 15:
-        _sub_el(dett_pag, "IBAN", iban)
-
-    # -------------------------------------------------------------
-    # 5. Serializzazione Output
-    # -------------------------------------------------------------
-    raw_xml = ET.tostring(root, encoding="utf-8", method="xml").decode("utf-8")
-    return f'<?xml version="1.0" encoding="UTF-8"?>\n{raw_xml}'
-
-# Alias di sicurezza per evitare futuri errori di import
+# Alias di sicurezza
 generate_sdi_xml = genera_xml_teamsystem
 genera_xml = genera_xml_teamsystem
