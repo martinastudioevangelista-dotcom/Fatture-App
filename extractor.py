@@ -1,22 +1,23 @@
 """
 extractor.py
-Motore Universale di Estrazione Fiscale Multi-Layout a Doppio Binario:
-- Binario 1: OpenAI AI Vision / Structured Output (per QUALSIASI layout o scansione grafica)
-- Binario 2: Motore Euristico a 4 Vie (Foglio SdI, Fatture in Cloud, Commerciali, Fornitori Esteri)
+Motore Universale di Estrazione Fiscale Multi-Layout a Visione AI.
+Supporta qualsiasi formato grafico: scansioni, PDF vettoriali, fogli SdI, estero e commerciali.
 """
 
+import base64
 import io
 import json
 import os
 import re
+import urllib.request
 from datetime import datetime
 
 
 # =====================================================================
-# 1. LETTURA TESTO E IMMAGINI DA PDF MULTI-PAGINA
+# 1. ESTRAZIONE TESTO E IMMAGINI VISIVE DA PDF MULTI-PAGINA
 # =====================================================================
-def _estrai_testo_da_pdf(file_input) -> str:
-    """Estrae testo da PDF vettoriali usando le migliori librerie disponibili."""
+def _estrai_contenuto_pdf(file_input):
+    """Estrae sia il testo sia le immagini delle pagine (per le scansioni grafiche)."""
     if hasattr(file_input, "read"):
         file_input.seek(0)
         pdf_bytes = file_input.read()
@@ -30,9 +31,33 @@ def _estrai_testo_da_pdf(file_input) -> str:
         with open(file_input, "rb") as f:
             pdf_bytes = f.read()
     else:
-        return ""
+        return "", []
 
     testo = ""
+    immagini_b64 = []
+
+    # Tentativo 1: PyMuPDF (fitz) - Il migliore per testo e rendering visivo
+    try:
+        import fitz
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            t = page.get_text()
+            if t:
+                testo += t + "\n"
+            # Renderizza le prime 3 pagine a immagine per OpenAI Vision
+            if len(immagini_b64) < 3:
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("jpeg")
+                immagini_b64.append(
+                    base64.b64encode(img_bytes).decode("utf-8")
+                )
+        if testo.strip() or immagini_b64:
+            return testo, immagini_b64
+    except Exception:
+        pass
+
+    # Tentativo 2: pypdf / PyPDF2
     for mod_name in ["pypdf", "PyPDF2"]:
         try:
             mod = __import__(mod_name)
@@ -41,11 +66,20 @@ def _estrai_testo_da_pdf(file_input) -> str:
                 t = page.extract_text()
                 if t:
                     testo += t + "\n"
-            if testo.strip():
-                return testo
+                # Estrazione immagini incorporate nelle scansioni
+                if hasattr(page, "images") and len(immagini_b64) < 3:
+                    for img in page.images:
+                        immagini_b64.append(
+                            base64.b64encode(img.data).decode("utf-8")
+                        )
+                        if len(immagini_b64) >= 3:
+                            break
+            if testo.strip() or immagini_b64:
+                return testo, immagini_b64
         except Exception:
             pass
 
+    # Tentativo 3: pdfplumber
     try:
         import pdfplumber
 
@@ -55,160 +89,141 @@ def _estrai_testo_da_pdf(file_input) -> str:
                 if t:
                     testo += t + "\n"
         if testo.strip():
-            return testo
+            return testo, immagini_b64
     except Exception:
         pass
 
-    try:
-        import fitz
-
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page in doc:
-            testo += page.get_text() + "\n"
-        if testo.strip():
-            return testo
-    except Exception:
-        pass
-
-    try:
-        return pdf_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
+    return testo, immagini_b64
 
 
 def _pulisci_importo(val) -> float:
-    """Converte formati valuta italiani/europei in float pulito."""
+    """Converte qualsiasi importo in formato float."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
-    pulito = (
-        str(val).replace("€", "").replace("EUR", "").replace("eur", "").strip()
-    )
-    if "." in pulito and "," in pulito:
-        pulito = pulito.replace(".", "").replace(",", ".")
-    elif "," in pulito:
-        pulito = pulito.replace(",", ".")
+    s = str(val).replace("€", "").replace("EUR", "").strip()
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
     try:
-        m = re.search(r"[-+]?\d*\.?\d+", pulito)
+        m = re.search(r"[-+]?\d*\.?\d+", s)
         return float(m.group(0)) if m else 0.0
     except Exception:
         return 0.0
 
 
 # =====================================================================
-# 2. MOTORE AI (OPENAI GPT) PER QUALSIASI FORMATO GRAFICO
+# 2. PROMPT FISCALE E CHIAMATA OPENAI VISION
 # =====================================================================
-PROMPT_SISTEMA_FISCALE = """Sei un esperto contabile e fiscale italiano specializzato nella fatturazione elettronica SdI (FPR12) e riconciliazione TeamSystem CONSPAY.
-Analizza il documento ed estrai con precisione assoluta i campi richiesti. Restituisci SOLO un oggetto JSON valido (senza testo prima o dopo) con questa struttura esatta:
+PROMPT_FISCALE = """Sei un analizzatore contabile e fiscale esperto di fatturazione elettronica italiana SdI (FPR12) e TeamSystem CONSPAY.
+Analizza il documento (che può essere una fattura con foglio di stile ministeriale, una fattura commerciale, una scansione o una fattura estera) ed estrai TUTTI i campi contabili.
+
+Restituisci ESCLUSIVAMENTE un oggetto JSON valido con questa struttura esatta:
 {
-  "fornitore_nome": "Nome e Cognome o Ragione Sociale completa del fornitore (Cedente/Prestatore)",
-  "fornitore_piva": "Partita IVA (o Codice Fiscale se ditta individuale) del fornitore",
-  "fornitore_cf": "Codice Fiscale del fornitore",
-  "fornitore_nazione": "Codice nazione fornitore (IT per Italia, FR per Francia, ecc.)",
-  "fornitore_indirizzo": "Indirizzo completo del fornitore con via e civico",
-  "fornitore_cap": "CAP del fornitore (es. 80061 o 59708)",
-  "fornitore_comune": "Comune o città del fornitore",
-  "cliente_nome": "Ragione Sociale o Nome del cliente/committente (es. CASAZEN s.r.l.)",
+  "fornitore_nome": "Nome e Cognome o Ragione Sociale completa di chi emette la fattura (Cedente/Prestatore)",
+  "fornitore_piva": "Partita IVA (o Codice Fiscale) del fornitore",
+  "fornitore_cf": "Codice Fiscale del fornitore (se presente)",
+  "fornitore_nazione": "Codice nazione (IT per Italia, FR per Francia, ecc.)",
+  "fornitore_indirizzo": "Indirizzo completo del fornitore (via e numero civico)",
+  "fornitore_cap": "CAP del fornitore",
+  "fornitore_comune": "Comune o citta del fornitore",
+  "cliente_nome": "Ragione Sociale o Nome del cliente/committente (Cessionario/Committente)",
   "cliente_piva": "Partita IVA o Codice Fiscale del cliente",
-  "cliente_nazione": "Codice nazione cliente (default IT)",
+  "cliente_nazione": "IT",
   "cliente_indirizzo": "Indirizzo del cliente",
   "cliente_cap": "CAP del cliente",
   "cliente_comune": "Comune del cliente",
-  "numero": "Numero del documento o fattura",
+  "numero": "Numero della fattura o documento",
   "data": "Data del documento in formato YYYY-MM-DD",
-  "tipo_documento": "Tipo documento SdI (default TD01)",
+  "tipo_documento": "Tipo documento (default TD01)",
   "imponibile": 0.00,
   "aliquota_iva": 22.00,
   "imposta": 0.00,
   "totale": 0.00,
   "ritenuta": 0.00,
-  "natura": "Eventuale codice natura se IVA 0% (es. N3.2 per estero intra-UE, N2.2, ecc., altrimenti lasciare vuoto)",
-  "descrizione": "Descrizione sintetica dei servizi o beni forniti",
-  "scadenza": "Data scadenza pagamento in formato YYYY-MM-DD",
-  "iban": "Codice IBAN per il pagamento (fondamentale per CONSPAY)",
-  "metodo_pagamento": "MP05 per bonifico, MP08 per carta/pos, MP01 contanti"
+  "natura": "Codice natura se IVA 0% (es. N3.2 per estero intra-UE, N2.2, ecc., altrimenti lasciare vuoto)",
+  "descrizione": "Descrizione sintetica dei servizi o beni",
+  "scadenza": "Data di scadenza pagamento YYYY-MM-DD",
+  "iban": "Codice IBAN per il bonifico bancario",
+  "metodo_pagamento": "MP05 se bonifico, MP08 se carta, MP01 contanti"
 }
-Attenzione:
-- Se il fornitore è una persona fisica (es. Nome: ANTONIO, Cognome: FERRAIUOLO), "fornitore_nome" deve essere "ANTONIO FERRAIUOLO".
-- Se l'Aliquota IVA è 0, l'imposta DEVE essere 0.00 e la natura deve essere valorizzata (es. N3.2 o N2.2).
-- Non inventare dati: se un indirizzo manca, inserisci la città o stringa vuota."""
+Regole tassative:
+1. Se il fornitore ha 'Nome: X' e 'Cognome: Y', 'fornitore_nome' deve essere 'X Y'.
+2. Se l'Aliquota IVA è 0, 'imposta' deve essere 0.00 e 'natura' deve essere indicata (es. N3.2 per intra-UE o N2.2).
+3. Estrai con la massima cura l'IBAN e l'eventuale ritenuta d'acconto (notule professionisti)."""
 
 
-def _estrai_con_openai(testo: str, api_key: str):
-    """Chiama OpenAI GPT per estrarre i dati da testo o layout complessi."""
+def _chiama_openai_fiscale(testo: str, immagini_b64: list, api_key: str):
+    """Invia a OpenAI GPT-4o Vision le immagini delle pagine o il testo estratto."""
     if not api_key:
-        return None, "API Key non presente"
+        return None, "Chiave API mancante"
 
-    # Tentativo con libreria ufficiale OpenAI (supporta sia v1.x che v0.28)
+    # Se abbiamo immagini delle pagine (scansioni), usiamo la Visione AI
+    elementi_user = []
+    if testo and testo.strip():
+        elementi_user.append({
+            "type": "text",
+            "text": f"Ecco il testo rilevato dal PDF:\n\n{testo[:15000]}",
+        })
+
+    if immagini_b64:
+        for b64 in immagini_b64[:3]:
+            elementi_user.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}",
+                    "detail": "high",
+                },
+            })
+
+    if not elementi_user:
+        return None, "Nessun contenuto (testo o immagine) rilevato nel file."
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": PROMPT_FISCALE},
+            {"role": "user", "content": elementi_user},
+        ],
+    }
+
     try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": PROMPT_SISTEMA_FISCALE},
-                {
-                    "role": "user",
-                    "content": f"Ecco il testo estratto dalla fattura:\n\n{testo[:15000]}",
-                },
-            ],
+        # Chiamata HTTP diretta universale (zero problemi di versione libreria)
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key.strip()}",
+            },
         )
-        risposta_testo = response.choices[0].message.content
-        return json.loads(risposta_testo), None
-    except Exception as e_v1:
-        # Fallback HTTP universale per massima compatibilità
-        try:
-            import urllib.request
-
-            req_data = json.dumps({
-                "model": "gpt-4o-mini",
-                "temperature": 0.0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": PROMPT_SISTEMA_FISCALE},
-                    {
-                        "role": "user",
-                        "content": f"Ecco il testo della fattura:\n\n{testo[:15000]}",
-                    },
-                ],
-            }).encode("utf-8")
-
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=req_data,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                res_body = json.loads(resp.read().decode("utf-8"))
-                return (
-                    json.loads(res_body["choices"][0]["message"]["content"]),
-                    None,
-                )
-        except Exception as e_http:
-            return None, f"Errore chiamata OpenAI: {str(e_v1)} | {str(e_http)}"
+        with urllib.request.urlopen(req, timeout=40) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            json_text = res_data["choices"][0]["message"]["content"]
+            return json.loads(json_text), None
+    except Exception as e:
+        return None, f"Errore chiamata OpenAI: {str(e)}"
 
 
 # =====================================================================
-# 3. MOTORE EURISTICO A 4 VIE (FALLBACK DETERMINISTICO OFFLINE)
+# 3. MOTORE EURISTICO MULTI-LAYOUT (OFFLINE)
 # =====================================================================
 def _estrai_euristico_multi_layout(testo: str) -> dict:
-    """Motore deterministico multi-layout: SdI, Fornitori Esteri, Fatture in Cloud, Notule."""
+    """Parser euristico per fogli ministeriali SdI, commerciali e fornitori esteri."""
     dati = {
-        "fornitore_nome": "FORNITORE",
-        "fornitore_piva": "09847131217",
+        "fornitore_nome": "",
+        "fornitore_piva": "",
+        "fornitore_cf": "",
         "fornitore_nazione": "IT",
         "fornitore_indirizzo": "",
         "fornitore_cap": "",
         "fornitore_comune": "",
-        "cliente_nome": "CASAZEN s.r.l.",
-        "cliente_piva": "09847131217",
+        "cliente_nome": "",
+        "cliente_piva": "",
         "cliente_nazione": "IT",
         "cliente_indirizzo": "",
         "cliente_cap": "",
@@ -222,21 +237,24 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         "totale": 0.0,
         "ritenuta": 0.0,
         "natura": "",
-        "descrizione": "Prestazione di servizi / Beni",
+        "descrizione": "Fornitura di beni / servizi",
         "scadenza": "",
         "iban": "",
         "metodo_pagamento": "MP05",
     }
 
-    # 1. FORNITORI ESTERI (CGI / SGB Finance)
-    t_upper = testo.upper()
+    if not testo:
+        return dati
+
+    # Layout Fornitori Esteri UE (CGI / SGB)
+    t_up = testo.upper()
     if (
-        "CGI FINANCE" in t_upper
-        or "SGB FINANCE" in t_upper
-        or "MARCQ EN BAROEUL" in t_upper
+        "CGI FINANCE" in t_up
+        or "SGB FINANCE" in t_up
+        or "MARCQ EN BAROEUL" in t_up
     ):
         dati["fornitore_nome"] = (
-            "SGB FINANCE" if "SGB" in t_upper else "CGI FINANCE"
+            "SGB FINANCE" if "SGB" in t_up else "CGI FINANCE"
         )
         dati["fornitore_piva"] = "12345678901"
         dati["fornitore_nazione"] = "FR"
@@ -246,7 +264,7 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         dati["aliquota_iva"] = 0.0
         dati["natura"] = "N3.2"
 
-    # 2. FOGLIO DI STILE SDI (Persona Fisica / Società)
+    # Layout Foglio di Stile SdI (Nome + Cognome / Denominazione)
     m_ced = re.search(
         r"Dati del cedente\s*/\s*prestatore(.*?)(?=Dati del cessionario|\Z)",
         testo,
@@ -265,15 +283,15 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         elif m_den:
             dati["fornitore_nome"] = m_den.group(1).strip()
 
-        m_piva = re.search(
+        m_p = re.search(
             r"Identificativo fiscale ai fini IVA:\s*(?:IT)?([A-Za-z0-9]+)",
             b_ced,
         )
-        if m_piva:
-            dati["fornitore_piva"] = m_piva.group(1).strip()
-        m_cf = re.search(r"Codice fiscale:\s*([A-Za-z0-9]+)", b_ced)
-        if m_cf and not m_piva:
-            dati["fornitore_piva"] = m_cf.group(1).strip()
+        if m_p:
+            dati["fornitore_piva"] = m_p.group(1).strip()
+        m_c = re.search(r"Codice fiscale:\s*([A-Za-z0-9]+)", b_ced)
+        if m_c and not dati["fornitore_piva"]:
+            dati["fornitore_piva"] = m_c.group(1).strip()
 
         m_ind = re.search(r"Indirizzo:\s*([^\n\r]+)", b_ced, re.IGNORECASE)
         if m_ind:
@@ -288,7 +306,7 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         if m_naz:
             dati["fornitore_nazione"] = m_naz.group(1).strip().upper()
 
-    # 3. CESSIONARIO (CLIENTE)
+    # Cessionario (Cliente)
     m_ces = re.search(
         r"Dati del cessionario\s*/\s*committente(.*?)(?=Dati generali|\Z)",
         testo,
@@ -301,12 +319,12 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         )
         if m_c_den:
             dati["cliente_nome"] = m_c_den.group(1).strip()
-        m_c_piva = re.search(
+        m_c_p = re.search(
             r"Identificativo fiscale ai fini IVA:\s*(?:IT)?([A-Za-z0-9]+)",
             b_ces,
         )
-        if m_c_piva:
-            dati["cliente_piva"] = m_c_piva.group(1).strip()
+        if m_c_p:
+            dati["cliente_piva"] = m_c_p.group(1).strip()
         m_c_ind = re.search(r"Indirizzo:\s*([^\n\r]+)", b_ces, re.IGNORECASE)
         if m_c_ind:
             dati["cliente_indirizzo"] = m_c_ind.group(1).strip()
@@ -317,7 +335,7 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
         if m_c_com:
             dati["cliente_comune"] = m_c_com.group(1).strip()
 
-    # 4. DATI DOCUMENTO (Numero, Data, Importi, Ritenuta, IBAN)
+    # Dati contabili
     m_num = re.search(
         r"(?:Numero documento|Fattura n\.?|Numero:?)\s*([^\n\r]+)",
         testo,
@@ -373,6 +391,7 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
     if m_rit:
         dati["ritenuta"] = _pulisci_importo(m_rit.group(1))
 
+    # IBAN per CONSPAY
     m_iban = re.search(
         r"\b(IT\d{2}[A-Za-z0-9]{22})\b", testo.replace(" ", "").upper()
     )
@@ -385,6 +404,50 @@ def _estrai_euristico_multi_layout(testo: str) -> dict:
     return dati
 
 
+def _propaga_alias(dati: dict) -> dict:
+    """Popola tutte le chiavi alternative per garantire che app.py e la tabella vedano i dati."""
+    if not isinstance(dati, dict):
+        dati = {}
+
+    dati["imponibile"] = _pulisci_importo(dati.get("imponibile", 0.0))
+    dati["aliquota_iva"] = _pulisci_importo(dati.get("aliquota_iva", 22.0))
+    dati["imposta"] = _pulisci_importo(dati.get("imposta", 0.0))
+    dati["totale"] = _pulisci_importo(dati.get("totale", 0.0))
+    dati["ritenuta"] = _pulisci_importo(dati.get("ritenuta", 0.0))
+
+    if dati["totale"] == 0.0 and dati["imponibile"] > 0:
+        dati["totale"] = round(dati["imponibile"] + dati["imposta"], 2)
+
+    fn = dati.get("fornitore_nome") or dati.get("fornitore") or "FORNITORE"
+    fp = (
+        dati.get("fornitore_piva")
+        or dati.get("piva_fornitore")
+        or "09847131217"
+    )
+    cn = dati.get("cliente_nome") or dati.get("cliente") or "CASAZEN s.r.l."
+    cp = dati.get("cliente_piva") or dati.get("piva_cliente") or "09847131217"
+
+    # Alias Fornitore
+    dati["fornitore_nome"] = fn
+    dati["fornitore"] = fn
+    dati["cedente_denominazione"] = fn
+    dati["cedente_nome"] = fn
+    dati["fornitore_piva"] = fp
+    dati["cedente_piva"] = fp
+    dati["piva_fornitore"] = fp
+
+    # Alias Cliente
+    dati["cliente_nome"] = cn
+    dati["cliente"] = cn
+    dati["cessionario_denominazione"] = cn
+    dati["cessionario_nome"] = cn
+    dati["cliente_piva"] = cp
+    dati["cessionario_piva"] = cp
+    dati["piva_cliente"] = cp
+
+    return dati
+
+
 # =====================================================================
 # 4. FUNZIONE MASTER ATTESA DA APP.PY (RIGA 161)
 # =====================================================================
@@ -393,56 +456,34 @@ def estrai_dati_fattura(file_input, file_name="", api_key=None, **kwargs):
 
     Restituisce: (dati, motore, testo_raw, err_ai)
     """
-    testo_raw = _estrai_testo_da_pdf(file_input)
+    testo_raw, immagini_b64 = _estrai_contenuto_pdf(file_input)
     api_key_effettiva = (
         api_key
         or os.environ.get("OPENAI_API_KEY")
         or kwargs.get("openai_api_key")
     )
 
-    dati = None
-    motore = "Motore Euristico Determinista"
-    err_ai = None
-
-    # STRATEGIA 1: Se c'è la chiave OpenAI, usa l'AI per QUALSIASI formato grafico
+    # 1. TENTATIVO CON VISIONE AI (GPT-4o Vision)
     if api_key_effettiva and str(api_key_effettiva).strip():
-        dati_ai, errore_ai = _estrai_con_openai(testo_raw, api_key_effettiva)
+        dati_ai, err_ai = _chiama_openai_fiscale(
+            testo_raw, immagini_b64, api_key_effettiva
+        )
         if dati_ai and isinstance(dati_ai, dict):
-            # Normalizzazione numerica
-            dati_ai["imponibile"] = _pulisci_importo(
-                dati_ai.get("imponibile", 0.0)
-            )
-            dati_ai["aliquota_iva"] = _pulisci_importo(
-                dati_ai.get("aliquota_iva", 22.0)
-            )
-            dati_ai["imposta"] = _pulisci_importo(dati_ai.get("imposta", 0.0))
-            dati_ai["totale"] = _pulisci_importo(dati_ai.get("totale", 0.0))
-            dati_ai["ritenuta"] = _pulisci_importo(
-                dati_ai.get("ritenuta", 0.0)
-            )
+            dati_finali = _propaga_alias(dati_ai)
+            motore = "OpenAI GPT-4o Vision (Qualsiasi Layout Grafico)"
+            return dati_finali, motore, testo_raw, None
 
-            # Se l'aliquota è 0, assicura la coerenza formale
-            if dati_ai["aliquota_iva"] == 0.0:
-                dati_ai["imposta"] = 0.0
-                if not dati_ai.get("natura"):
-                    dati_ai["natura"] = (
-                        "N3.2"
-                        if dati_ai.get("fornitore_nazione") != "IT"
-                        else "N2.2"
-                    )
+    # 2. TENTATIVO EURISTICO MULTI-LAYOUT
+    dati_euristici = _estrai_euristico_multi_layout(testo_raw)
+    dati_finali = _propaga_alias(dati_euristici)
+    motore = "Motore Euristico Determinista Multi-Layout"
+    err_msg = (
+        "Elaborato con motore euristico offline"
+        if not api_key_effettiva
+        else "Fallback su euristica locale"
+    )
 
-            return (
-                dati_ai,
-                "OpenAI AI Vision/Text Engine",
-                testo_raw,
-                None,
-            )
-        else:
-            err_ai = errore_ai
-
-    # STRATEGIA 2: Fallback Euristico Multi-Layout
-    dati = _estrai_euristico_multi_layout(testo_raw)
-    return dati, motore, testo_raw, err_ai
+    return dati_finali, motore, testo_raw, err_msg
 
 
 # Alias di compatibilità
