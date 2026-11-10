@@ -448,3 +448,4 @@ if st.session_state.get("xml_content"):
 
     with st.expander("🔍 Visualizza e Copia Testo XML"):
         st.code(st.session_state["xml_content"], language="xml")
+# riavvio
