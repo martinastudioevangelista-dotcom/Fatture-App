@@ -1,3 +1,4 @@
+
 Denominazione>{cli_nome}</Denominazione>",
         "        </Anagrafica>",
         "      </DatiAnagrafici>",
