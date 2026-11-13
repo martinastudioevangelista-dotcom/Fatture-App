@@ -40,6 +40,7 @@ Denominazione>{cli_nome}</Denominazione>",
         f"        <ModalitaPagamento>{metodo_pag}</ModalitaPagamento>",
         f"        <DataScadenzaPagamento>{scadenza_pag}</DataScadenzaPagamento>",
         f" 
+        
 
 
 # Alias di compatibilità
