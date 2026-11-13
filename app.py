@@ -143,7 +143,9 @@ def genera_payload_e_xml(dati_dict, cod_dest_val):
         }]
     }
     xml_str = genera_xml_teamsystem(payload)
-    piva_trasm = cess_p if cess_p else "00000000000"
+    piva_trasm = str(cess_p or ("09847131217" if ced_p != "IT" else "00000000000")).strip().upper()
+    if piva_trasm.startswith("IT") and len(piva_trasm) == 13:
+        piva_trasm = piva_trasm[2:]
     nome_file = f"IT{piva_trasm}_00001.xml"
     return xml_str, nome_file, payload
 
@@ -189,6 +191,9 @@ inv = st.session_state["invoice_data"]
 if st.session_state.get("errore_ai"):
     st.warning(f"⚠️ Avviso: {st.session_state['errore_ai']}")
 
+if inv.get("valuta") and str(inv.get("valuta")).upper() != "EUR":
+    st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML per SdI / TeamSystem.")
+
 # ---------------------------------------------------------
 # FASE 2: VERIFICA RAPIDA DEI SOGGETTI E INVERSIONE
 # ---------------------------------------------------------
@@ -229,12 +234,10 @@ with st.form("form_revisione_totale"):
     st.markdown("#### 📄 1. Estremi del Documento & Tipo Tracciato")
     cd1, cd2, cd3, cd4 = st.columns(4)
     with cd1:
-        tipo_doc_default = "TD17" if inv.get("cedente_paese") != "IT" and inv.get("tipo_documento") == "TD17" else inv.get("tipo_documento", "TD01")
-        tipo_doc = st.selectbox(
-            "Tipo Documento",
-            ["TD01 - Fattura Ordinaria", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"],
-            index=1 if tipo_doc_default == "TD17" else 0
-        ).split(" - ")[0]
+        tipo_doc_default = str(inv.get("tipo_documento") or "TD01")
+        opzioni_td = ["TD01 - Fattura Ordinaria", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"]
+        idx_td = {"TD01": 0, "TD17": 1, "TD04": 2, "TD24": 3}.get(tipo_doc_default, 0)
+        tipo_doc = st.selectbox("Tipo Documento", opzioni_td, index=idx_td).split(" - ")[0]
     with cd2:
         num_doc = st.text_input("Numero Documento", value=str(inv.get("numero_documento", "1")))
     with cd3:
@@ -270,7 +273,7 @@ with st.form("form_revisione_totale"):
 
         ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")))
         ci1, ci2, ci3 = st.columns([2, 3, 1])
-        ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=5)
+        ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=12)
         ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
         ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM" if ced_paese == "IT" else ""))[:2].upper(), max_chars=2)
 
@@ -323,7 +326,7 @@ with st.form("form_revisione_totale"):
 
     col_t1, col_t2 = st.columns([3, 1])
     with col_t1:
-        natura_default = "N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else str(inv.get("natura", ""))
+        natura_default = str(inv.get("natura") or ("N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else ""))
         natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per Fornitori UE)", value=natura_default)
     with col_t2:
         totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
@@ -344,7 +347,6 @@ with st.form("form_revisione_totale"):
 # FASE 4: AGGIORNAMENTO DATI IN SESSIONE E RIGENERAZIONE
 # ---------------------------------------------------------
 if btn_submit:
-    # 1. Aggiorna lo stato dei dati con le modifiche manuali dell'utente
     inv["tipo_documento"] = tipo_doc
     inv["numero_documento"] = num_doc
     inv["data_documento"] = data_doc.strftime("%Y-%m-%d")
@@ -378,12 +380,10 @@ if btn_submit:
     
     st.session_state["invoice_data"] = inv
 
-    # 2. Rigenera il payload e l'XML
     xml_nuovo, nome_nuovo, payload_nuovo = genera_payload_e_xml(inv, cod_sdi)
     st.session_state["xml_content"] = xml_nuovo
     st.session_state["xml_filename"] = nome_nuovo
 
-    # 3. Ricalcola validazione
     quadratura_ok, errs = valida_quadratura_fiscale(
         payload_nuovo["riepilogo_iva"], payload_nuovo["totale_documento"], ritenuta=payload_nuovo["ritenuta"]
     )
@@ -417,7 +417,6 @@ if st.session_state.get("xml_content"):
             for a in anomalie:
                 st.write(f"- {a}")
 
-    # Buffer ZIP
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"].encode("utf-8"))
@@ -427,7 +426,6 @@ if st.session_state.get("xml_content"):
     zip_bytes.seek(0)
 
     with c_down2:
-        # Download con MIME octet-stream per garantire il salvataggio immediato su disco
         st.download_button(
             label="💾 SCARICA FILE XML ORA",
             data=st.session_state["xml_content"].encode("utf-8"),
@@ -448,4 +446,3 @@ if st.session_state.get("xml_content"):
 
     with st.expander("🔍 Visualizza e Copia Testo XML"):
         st.code(st.session_state["xml_content"], language="xml")
-# riavvio
