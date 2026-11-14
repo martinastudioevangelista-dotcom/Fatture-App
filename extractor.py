@@ -1,9 +1,6 @@
 # === INIZIO FILE extractor.py ===
 """
-extractor.py - VERSIONE UNIVERSALE ITALIA + ESTERO (AUTO-DISCOVERY GEMINI VISION + CELLE 2D)
-- Preserva al 100% tutti i parser italiani consolidati (SdI, Cavit, Fatture in Cloud, Proforma).
-- Interroga ListModels di Google per usare automaticamente i modelli Gemini Vision attivi sulla chiave.
-- Unisce i blocchi anagrafici verticali vicini per estrarre indirizzi completi anche in modalità locale.
+extractor.py - VERSIONE UNIVERSALE ITALIA + ESTERO (AUTO-DISCOVERY GEMINI + ACCONTI + CELLE 2D)
 """
 
 import base64
@@ -20,6 +17,14 @@ EU_COUNTRIES = {
     "FR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT",
     "RO", "SE", "SI", "SK", "XI",
 }
+
+VALID_TD = {
+    "TD01", "TD02", "TD03", "TD04", "TD05", "TD06", "TD16", "TD17", "TD18",
+    "TD19", "TD20", "TD21", "TD22", "TD23", "TD24", "TD25", "TD26", "TD27",
+    "TD28", "TD29",
+}
+
+VALID_MP = {f"MP{i:02d}" for i in range(1, 24)}
 
 FOREIGN_COUNTRY_MAP = {
     "united states": "US", "usa": "US", "u.s.a.": "US", "stati uniti": "US",
@@ -78,6 +83,32 @@ def normalizza_codice_paese(paese: str, default: str = "IT") -> str:
     if len(p_up) == 2:
         return p_up
     return default
+
+
+def _normalizza_mp(val) -> str:
+    raw = str(val or "").strip()
+    up = raw.upper()
+    if up in VALID_MP:
+        return up
+    low = raw.lower()
+    if any(w in low for w in ("prel", "sepa", "sdd", "direct debit", "addebito", "domicilia")):
+        return "MP19"
+    if "rid" in low:
+        return "MP09"
+    if any(w in low for w in ("carta", "card", "credit", "bancomat", "pos")):
+        return "MP08"
+    if any(w in low for w in ("contant", "cash")):
+        return "MP01"
+    if any(w in low for w in ("assegn", "check", "cheque")):
+        return "MP02"
+    if "riba" in low or "ri.ba" in low:
+        return "MP12"
+    return "MP05"
+
+
+def _normalizza_td(val) -> str:
+    code = str(val or "TD01").strip().upper()
+    return code if code in VALID_TD else "TD01"
 
 
 def pulisci_cifra(s) -> float:
@@ -351,7 +382,6 @@ def estrai_indirizzo_cap_comune(testo_blocco: str, paese_hint: str = ""):
         if m_cap_s:
             cap = m_cap_s.group(1)
 
-    # Supporta anche numero civico PRIMA del nome via (es. "69 AVENUE DE FLANDRE", "199/C PIAZZA SANNAZARO")
     m_via = re.search(
         r"(?:\b\d{1,5}[A-Za-z]?(?:/[A-Za-z0-9\-]+)?\s*,?\s+)?"
         r"\b(?:Via|Viale|V\.le|Corso|C\.so|Piazza|P\.zza|Strada|Str\.|Vicolo|Largo|Loc\.|Localit[àa]|"
@@ -417,6 +447,7 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
     tax = pulisci_cifra(dati.get("imposta"))
     tot = pulisci_cifra(dati.get("totale_documento") or dati.get("totale"))
     rit = pulisci_cifra(dati.get("ritenuta"))
+    acc = pulisci_cifra(dati.get("acconto"))
     natura_in = str(dati.get("natura") or "").strip()
 
     if f_paese != "IT":
@@ -432,6 +463,11 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
                     tot = imp
                 elif imp == 0.0 and tot > 0:
                     imp = tot
+                elif acc > 0 and imp > 0 and abs((imp - acc) - tot) <= 0.05:
+                    tot = imp
+                elif acc == 0.0 and imp > tot > 0 and rit == 0.0:
+                    acc = round(imp - tot, 2)
+                    tot = imp
         else:
             if aliq is None or aliq == 0.0:
                 aliq = round((tax / imp) * 100.0, 2) if imp > 0 else 0.0
@@ -439,6 +475,8 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
                 tot = round(imp + tax, 2)
             elif imp == 0.0 and tot > tax:
                 imp = round(tot - tax, 2)
+            elif acc > 0 and imp > 0 and abs(((imp + tax) - acc) - tot) <= 0.05:
+                tot = round(imp + tax, 2)
             if imp > 0 and abs(tot - (imp + tax)) > 0.02:
                 tot = round(imp + tax, 2)
     else:
@@ -451,6 +489,8 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
                 tot = imp
             elif imp == 0.0 and tot > 0:
                 imp = tot
+            elif acc > 0 and imp > 0 and abs((imp - acc) - tot) <= 0.05:
+                tot = imp
         else:
             if imp > 0 and tax == 0.0:
                 tax = round((imp * aliq) / 100.0, 2)
@@ -464,7 +504,10 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
                 tax = round(tot - imp, 2)
 
             if imp > 0 and tax > 0 and abs(tot - (imp + tax)) > 0.02:
-                tot = round(imp + tax, 2)
+                if rit == 0.0 and acc == 0.0:
+                    tot = round(imp + tax, 2)
+                elif acc > 0 and abs(((imp + tax) - acc) - tot) <= 0.05:
+                    tot = round(imp + tax, 2)
 
     if aliq is None:
         aliq = 0.0
@@ -531,11 +574,10 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
         scad_raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", scad_raw) else dt
     )
 
-    metodo = str(
-        dati.get("modalita_pagamento")
-        or dati.get("metodo_pagamento")
-        or "MP05"
-    ).strip()
+    metodo = _normalizza_mp(
+        dati.get("modalita_pagamento") or dati.get("metodo_pagamento")
+    )
+    tipo_doc = _normalizza_td(dati.get("tipo_documento"))
     iban_val = estrai_iban_universale(str(dati.get("iban") or ""))
 
     if f_paese != "IT" and aliq == 0.0:
@@ -544,7 +586,7 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
         natura_val = natura_in if aliq == 0.0 else ""
 
     return {
-        "tipo_documento": str(dati.get("tipo_documento") or "TD01"),
+        "tipo_documento": tipo_doc,
         "numero_documento": num,
         "numero": num,
         "data_documento": dt,
@@ -588,6 +630,7 @@ def _ponte_chiavi_e_quadratura(dati: dict) -> dict:
         "aliquota_iva": round(aliq, 2),
         "imposta": round(tax, 2),
         "ritenuta": round(rit, 2),
+        "acconto": round(acc, 2),
         "totale_documento": round(tot, 2),
         "totale": round(tot, 2),
         "natura": natura_val,
@@ -1073,6 +1116,11 @@ def _estrai_importi_multilingua(testo_ricerca: str, celle_visive: list = None):
                 if not trovato and len(valori_valuta) >= 2 and valori_valuta[-2] <= totale:
                     imponibile = valori_valuta[-2]
 
+    lbl_acc = r"Acompte|Deposit(?:\s+of)?|Acconto|Anticipo|Anzahlung|Already\s+paid"
+    acconto = cerca_importo(lbl_acc)
+    if acconto == 0.0:
+        acconto = _cerca_importo_in_celle(celle_visive, rf"^(?:{lbl_acc})$", prendi_ultimo=True)
+
     valuta = "EUR"
     if re.search(r"\bUSD\b|\$", testo_ricerca) and not re.search(r"\bEUR\b|\bEUROS\b|€", testo_ricerca, re.IGNORECASE):
         valuta = "USD"
@@ -1088,7 +1136,7 @@ def _estrai_importi_multilingua(testo_ricerca: str, celle_visive: list = None):
     )
     ritenuta = pulisci_cifra(m_rit.group(1)) if m_rit else 0.0
 
-    return imponibile, imposta, aliquota, totale, ritenuta, valuta
+    return imponibile, imposta, aliquota, totale, ritenuta, acconto, valuta
 
 
 def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spaziali: list = None, celle_visive: list = None):
@@ -1208,7 +1256,9 @@ def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spa
             if scad_parsed:
                 data_scad = scad_parsed
 
-    imponibile, imposta, aliquota, totale, ritenuta, valuta = _estrai_importi_multilingua(testo_visuale, celle_visive=celle_visive)
+    imponibile, imposta, aliquota, totale, ritenuta, acconto, valuta = _estrai_importi_multilingua(
+        testo_visuale, celle_visive=celle_visive
+    )
     if imponibile == 0.0 and totale > 0.0 and imposta == 0.0:
         imponibile = totale
 
@@ -1228,6 +1278,10 @@ def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spa
     natura_val = ""
     if ced_paese != "IT" and aliquota == 0.0:
         natura_val = "N3.2" if ced_paese in EU_COUNTRIES else "N2.2"
+
+    metodo_pag = "MP05"
+    if re.search(r"(?:prelievo|sepa|addebito\s*sepa)", testo_visuale, re.IGNORECASE):
+        metodo_pag = "MP19"
 
     return {
         "tipo_documento": tipo_doc,
@@ -1253,11 +1307,12 @@ def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spa
         "aliquota_prevalente": aliquota,
         "imposta": imposta,
         "ritenuta": ritenuta,
+        "acconto": acconto,
         "totale_documento": totale,
         "natura": natura_val,
         "iban": iban_doc,
         "data_scadenza": data_scad,
-        "modalita_pagamento": "MP05",
+        "modalita_pagamento": metodo_pag,
         "valuta": valuta,
     }
 
@@ -1357,7 +1412,6 @@ def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
                 ]
                 raw_blocks.sort(key=lambda b: (round(b[1] / 25), b[0]))
 
-                # Unisce blocchi verticalmente vicini nella stessa colonna (es. Nome + Via + CAP + Città)
                 merged_blocks = []
                 for b in raw_blocks:
                     bx0, by0, bx1, by1, btxt = b[0], b[1], b[2], b[3], b[4].strip()
@@ -1462,7 +1516,6 @@ def _parse_ai_json_text(raw_txt: str):
 
 
 def _scopri_modelli_gemini(api_key: str):
-    """Interroga Google ListModels per ottenere i modelli reali attivi sulla chiave API."""
     import urllib.request
     import urllib.error
 
@@ -1525,15 +1578,14 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
         "Sei un esperto contabile specializzato in fatturazione elettronica italiana (FPR12 SdI) e fatture estere (UE ed Extra-UE). "
         "Analizza visivamente TUTTE le pagine della fattura allegata (inclusi loghi grafici, riquadri e tabelle finali), qualunque sia la lingua (EN, FR, DE, ES, IT, ecc.).\n"
         "REGOLE CRITICHE:\n"
-        "1. CEDENTE (cedente_*): è SEMPRE il fornitore estero o italiano che EMETTE la fattura (leggi anche il nome dentro eventuali loghi grafici se non ripetuto nel testo). Se sono presenti più Partite IVA nel piè di pagina (es. Gruppo IVA vs società emittente) scegli quella specifica del fornitore, NON codici SEPA tipo FR75ZZZ...\n"
-        "2. CESSIONARIO (cessionario_*): è SEMPRE l'acquirente/cliente intestatario della fattura (ignora eventuali 'Adresse de livraison' / 'Ship to' diversi dal cliente intestatario). Collega al cliente la sua P.IVA anche se si trova in un riquadro separato ('ID TVA', 'Référence client', ecc.).\n"
-        "3. CODICI PAESE ISO-2: usa ISO 3166-1 alpha-2 (GB per Regno Unito, GR per Grecia, FR, DE, IE, US, IT...). In cedente_piva e cessionario_piva metti il codice senza prefisso Paese duplicato.\n"
-        "4. QUADRATURA IMPORTI: date in YYYY-MM-DD, numeri float con punto decimale. Se sono presenti spese accessorie/trasporto ('Total HT Net' / 'Total TTC') e acconti già versati ('Acompte' / 'Deposit' / 'Net à payer'), usa come imponibile il totale imponibile netto della fattura ('Total HT Net') e come totale_documento il 'Total TTC' così che imponibile + imposta == totale_documento. Se IVA/VAT è 0 o esente/reverse charge -> imposta=0.0, aliquota_prevalente=0.0, natura='N3.2' (intra-UE) o 'N2.2' (extra-UE).\n"
-        "5. PAGINE MULTIPLE: la pagina 1 può essere solo una lettera accompagnatoria e i dati fiscali/tabella possono trovarsi a pagina 2 o nell'ultima pagina.\n"
+        "1. CEDENTE (cedente_*): è SEMPRE il fornitore estero o italiano che EMETTE la fattura (leggi anche il nome dentro eventuali loghi grafici). Se ci sono più P.IVA nel piè di pagina (Gruppo IVA vs società), scegli quella specifica del fornitore, NON codici SEPA tipo FR75ZZZ...\n"
+        "2. CESSIONARIO (cessionario_*): è SEMPRE l'acquirente/cliente intestatario (ignora eventuali 'Adresse de livraison' / 'Ship to' diversi dal cliente). Collega al cliente la sua P.IVA anche se è in un riquadro separato ('ID TVA', 'Référence client').\n"
+        "3. CODICI: tipo_documento deve essere SOLO uno tra TD01, TD04, TD17, TD18, TD24 (MAI FPR12). modalita_pagamento deve essere un codice MP valido (MP05 bonifico, MP19 prelievo/SEPA, MP08 carta). Paesi ISO-2 (GB, GR, FR, DE, IE, US, IT).\n"
+        "4. QUADRATURA E ACCONTI: date in YYYY-MM-DD, numeri float con punto decimale. imponibile = imponibile totale fattura (es. Total HT Net se ci sono spese trasporto). totale_documento = totale lordo della fattura (Total TTC = imponibile + imposta). Se c'è un acconto/deposito già pagato ('Acompte', 'Deposit', 'Acconto'), metti quell'importo nel campo 'acconto' (altrimenti 0.0) senza sottrarlo da totale_documento. Se IVA/VAT è 0 -> imposta=0.0, aliquota_prevalente=0.0, natura='N3.2' (intra-UE) o 'N2.2' (extra-UE).\n"
         "Rispondi ESCLUSIVAMENTE con un JSON valido (oggetto singolo) con queste chiavi esatte:\n"
         "cedente_denominazione, cedente_paese, cedente_piva, cedente_cf, cedente_indirizzo, cedente_cap, cedente_comune, cedente_provincia, "
         "cessionario_denominazione, cessionario_paese, cessionario_piva, cessionario_cf, cessionario_indirizzo, cessionario_cap, cessionario_comune, cessionario_provincia, "
-        "numero_documento, data_documento, tipo_documento, imponibile, aliquota_prevalente, imposta, ritenuta, totale_documento, natura, iban, data_scadenza, modalita_pagamento, valuta, descrizione."
+        "numero_documento, data_documento, tipo_documento, imponibile, aliquota_prevalente, imposta, ritenuta, acconto, totale_documento, natura, iban, data_scadenza, modalita_pagamento, valuta, descrizione."
     )
 
     if k.startswith("sk-"):
