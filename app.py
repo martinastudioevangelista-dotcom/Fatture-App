@@ -1,4 +1,5 @@
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (Flusso di Aggiornamento e Download Risolto)
+# === INIZIO FILE app.py ===
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY
 import io
 import zipfile
 import pandas as pd
@@ -59,12 +60,10 @@ except Exception:
     GDRIVE_OK = False
     def upload_to_drive(*args, **kwargs): return False, "Drive non attivo"
 
-# Inizializzazione Session State
 for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "validation_report", "gdrive_status", "motore_usato", "testo_grezzo", "errore_ai", "xml_aggiornato"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
-# Sidebar
 with st.sidebar:
     st.title("⚙️ Impostazioni")
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -129,6 +128,7 @@ def genera_payload_e_xml(dati_dict, cod_dest_val):
         "aliquota_prevalente": aliq,
         "imposta": iva,
         "ritenuta": float(dati_dict.get("ritenuta", 0.0)),
+        "acconto": float(dati_dict.get("acconto", 0.0)),
         "totale_documento": float(dati_dict.get("totale_documento", 0.0)),
         "natura": nat,
         "iban": dati_dict.get("iban", ""),
@@ -168,12 +168,10 @@ if uploaded_file is not None:
             st.session_state["errore_ai"] = err_ai
             st.session_state["last_file_id"] = file_id
             
-            # Generazione automatica iniziale
             xml_str_init, nome_xml_init, payload_init = genera_payload_e_xml(dati, codice_dest_default)
             st.session_state["xml_content"] = xml_str_init
             st.session_state["xml_filename"] = nome_xml_init
             
-            # Verifica quadratura iniziale
             ok_init, errs_init = valida_quadratura_fiscale(
                 payload_init["riepilogo_iva"], payload_init["totale_documento"], ritenuta=payload_init["ritenuta"]
             )
@@ -188,11 +186,14 @@ if st.session_state["invoice_data"] is None:
 
 inv = st.session_state["invoice_data"]
 
+if st.session_state.get("motore_usato"):
+    st.caption(f"⚙️ Motore utilizzato: **{st.session_state['motore_usato']}**")
+
 if st.session_state.get("errore_ai"):
     st.warning(f"⚠️ Avviso: {st.session_state['errore_ai']}")
 
 if inv.get("valuta") and str(inv.get("valuta")).upper() != "EUR":
-    st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML per SdI / TeamSystem.")
+    st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML.")
 
 # ---------------------------------------------------------
 # FASE 2: VERIFICA RAPIDA DEI SOGGETTI E INVERSIONE
@@ -308,13 +309,19 @@ with st.form("form_revisione_totale"):
         scadenza_pag = st.date_input("Scadenza Pagamento", value=d_scad)
     with cp3:
         metodo_default = inv.get("modalita_pagamento", "MP05")
-        metodi_list = ["MP05 - Bonifico Bancario", "MP08 - Carta di Pagamento", "MP12 - RiBa", "MP01 - Contanti"]
-        idx_met = 1 if metodo_default == "MP08" else 0
+        metodi_list = [
+            "MP05 - Bonifico Bancario",
+            "MP08 - Carta di Pagamento",
+            "MP19 - SEPA Direct Debit / Prelievo",
+            "MP12 - RiBa",
+            "MP01 - Contanti",
+        ]
+        idx_met = {"MP05": 0, "MP08": 1, "MP19": 2, "MP12": 3, "MP01": 4}.get(metodo_default, 0)
         metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met).split(" - ")[0]
 
     st.markdown("---")
-    st.markdown("#### 💰 4. Sezione Contabile, IVA & Ritenuta")
-    ce1, ce2, ce3, ce4 = st.columns(4)
+    st.markdown("#### 💰 4. Sezione Contabile, IVA, Ritenuta & Acconto")
+    ce1, ce2, ce3, ce4, ce5 = st.columns(5)
     with ce1:
         imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
     with ce2:
@@ -323,23 +330,28 @@ with st.form("form_revisione_totale"):
         imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
     with ce4:
         ritenuta_1 = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01)
+    with ce5:
+        acconto_1 = st.number_input("Acconto già versato (€)", value=float(inv.get("acconto", 0.0)), step=0.01)
 
     col_t1, col_t2 = st.columns([3, 1])
     with col_t1:
         natura_default = str(inv.get("natura") or ("N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else ""))
         natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per Fornitori UE)", value=natura_default)
     with col_t2:
-        totale_doc = st.number_input("Totale a Pagare (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
+        totale_doc = st.number_input("Totale Fattura AdE (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
 
-    # Feedback Live di Quadratura
     lordo_live = round(imponibile_1 + imposta_1, 2)
-    netto_live = round(lordo_live - ritenuta_1, 2)
-    diff_live = min(abs(netto_live - totale_doc), abs(lordo_live - totale_doc))
+    netto_rit_live = round(lordo_live - ritenuta_1, 2)
+    netto_pag_live = round(max(0.0, lordo_live - ritenuta_1 - acconto_1), 2)
+    diff_live = min(abs(netto_rit_live - totale_doc), abs(lordo_live - totale_doc))
 
     if diff_live <= 0.02:
-        st.success(f"🟢 **Quadratura Verificata**: {imponibile_1:.2f}€ + {imposta_1:.2f}€" + (f" - {ritenuta_1:.2f}€" if ritenuta_1 > 0 else "") + f" = {totale_doc:.2f}€")
+        msg_q = f"🟢 **Quadratura Verificata**: {imponibile_1:.2f}€ + {imposta_1:.2f}€ = {lordo_live:.2f}€"
+        if acconto_1 > 0 or ritenuta_1 > 0:
+            msg_q += f" ➔ **Netto residuo da pagare (CONSPAY): {netto_pag_live:.2f}€**"
+        st.success(msg_q)
     else:
-        st.warning(f"🟡 **Scostamento**: Netto calcolato {netto_live:.2f}€ vs inserito {totale_doc:.2f}€")
+        st.warning(f"🟡 **Scostamento**: Totale calcolato {lordo_live:.2f}€ vs inserito {totale_doc:.2f}€")
 
     btn_submit = st.form_submit_button("💾 Aggiorna Modifiche e Rigenera XML", type="primary", use_container_width=True)
 
@@ -372,6 +384,7 @@ if btn_submit:
     inv["aliquota_prevalente"] = aliquota_1
     inv["imposta"] = imposta_1
     inv["ritenuta"] = ritenuta_1
+    inv["acconto"] = acconto_1
     inv["totale_documento"] = totale_doc
     inv["natura"] = natura_iva
     inv["iban"] = iban_doc
@@ -446,3 +459,4 @@ if st.session_state.get("xml_content"):
 
     with st.expander("🔍 Visualizza e Copia Testo XML"):
         st.code(st.session_state["xml_content"], language="xml")
+# === FINE FILE app.py ===
