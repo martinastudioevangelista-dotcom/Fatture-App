@@ -1,8 +1,9 @@
 # === INIZIO FILE extractor.py ===
 """
-extractor.py - VERSIONE UNIVERSALE ITALIA + ESTERO (MULTI-PAGINA & QUADRATURA VISIVA)
+extractor.py - VERSIONE UNIVERSALE ITALIA + ESTERO (VISION AI DIRETTA + CELLE VISIVE 2D)
 - Preserva al 100% tutti i parser italiani consolidati (SdI, Cavit, Fatture in Cloud, Proforma).
-- Ricostruisce le righe visive del PDF per intercettare imponibile, IVA e totale in qualsiasi posizione.
+- Vision AI con fallback HTTPS diretto su immagini multipagina (legge qualsiasi logo/layout/lingua).
+- Lettore locale 2D a celle visive (legge valori sotto o a destra delle etichette, più pagine, qualsiasi cliente IT).
 """
 
 import base64
@@ -222,7 +223,7 @@ def estrai_vat_ids(testo: str) -> list:
         cod = re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
         if ("CH", cod) not in visti:
             visti.add(("CH", cod))
-            risultati.append(("CH", cod, m.start()))
+            risultati.append(("CH", cod, m.start(), False))
 
     prefissi = "AT|BE|BG|CY|CZ|DE|DK|EE|EL|GR|ES|FI|FR|GB|UK|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK|XI|NO"
     pat_vat_eu = rf"\b({prefissi})[\s.-]*([A-Z0-9]{{1,4}}(?:[\s.-]*[A-Z0-9]{{2,5}}){{1,4}})\b"
@@ -231,6 +232,8 @@ def estrai_vat_ids(testo: str) -> list:
         body = re.sub(r"[\s.-]", "", m.group(2).upper())
         full = paese_raw + body
 
+        if re.match(r"^\d{2}ZZZ", body):
+            continue
         if len(body) < 7 or len(body) > 13:
             continue
         if not any(ch.isdigit() for ch in body):
@@ -240,20 +243,22 @@ def estrai_vat_ids(testo: str) -> list:
         if paese_raw == "IT" and not re.fullmatch(r"\d{11}", body):
             continue
 
+        ctx_before = testo[max(0, m.start() - 60):m.start()].lower()
+        is_group = bool(re.search(r"(gruppo\s*iva|groupe\s*tva|vat\s*group)", ctx_before))
         paese = normalizza_codice_paese(paese_raw)
         if (paese, body) not in visti:
             visti.add((paese, body))
-            risultati.append((paese, body, m.start()))
+            risultati.append((paese, body, m.start(), is_group))
 
     for m in re.finditer(
-        r"(?:P\.?\s*IVA|Partita\s+IVA|VAT(?:\s+ID|\s+No\.?|\s+Number)?|C\.?F\.?[\s/]*P\.?\s*IVA)[:\s]*(?:IT)?(\d{11})\b",
+        r"(?:P\.?\s*IVA|Partita\s+IVA|ID\s*TVA|VAT(?:\s+ID|\s+No\.?|\s+Number)?|C\.?F\.?[\s/]*P\.?\s*IVA)[:\s]*(?:IT)?(\d{11})\b",
         testo,
         re.IGNORECASE,
     ):
         cod = m.group(1)
         if ("IT", cod) not in visti:
             visti.add(("IT", cod))
-            risultati.append(("IT", cod, m.start()))
+            risultati.append(("IT", cod, m.start(), False))
 
     for m in re.finditer(
         r"(?:EIN|Tax\s*ID|Federal\s*Tax\s*ID|TIN)[:\s#]*([0-9]{2}-[0-9]{7})\b",
@@ -263,7 +268,7 @@ def estrai_vat_ids(testo: str) -> list:
         cod = m.group(1).replace("-", "")
         if ("US", cod) not in visti:
             visti.add(("US", cod))
-            risultati.append(("US", cod, m.start()))
+            risultati.append(("US", cod, m.start(), False))
 
     for m in re.finditer(r"(?<!\d)(\d{11})(?!\d)", testo):
         cod = m.group(1)
@@ -274,7 +279,7 @@ def estrai_vat_ids(testo: str) -> list:
             continue
         if ("IT", cod) not in visti:
             visti.add(("IT", cod))
-            risultati.append(("IT", cod, m.start()))
+            risultati.append(("IT", cod, m.start(), False))
 
     return risultati
 
@@ -286,7 +291,7 @@ def rileva_paese_da_blocco(testo_blocco: str, default: str = "") -> str:
     for nome_paese, iso in sorted(FOREIGN_COUNTRY_MAP.items(), key=lambda x: len(x[0]), reverse=True):
         if re.search(rf"\b{re.escape(nome_paese)}\b", t_low):
             return iso
-    if re.search(r"\b(italia|italy)\b", t_low):
+    if re.search(r"\b(italia|italy|italie)\b", t_low):
         return "IT"
     if re.search(r"\b(CA|NY|TX|FL|WA|DE|MA|IL|NJ|GA|NC|VA|PA|AZ|CO|NV|OH)\s+\d{5}(?:-\d{4})?\b", testo_blocco):
         return "US"
@@ -377,6 +382,7 @@ def estrai_indirizzo_cap_comune(testo_blocco: str, paese_hint: str = ""):
             "Dublin", "London", "Paris", "Berlin", "Munich", "Amsterdam", "Brussels",
             "Madrid", "Barcelona", "Luxembourg", "Zurich", "Geneva", "Vienna",
             "New York", "San Francisco", "Mountain View", "Austin", "Seattle", "Singapore",
+            "Grasse", "Napoli", "Catania", "Roma", "Milano",
         ):
             if re.search(rf"\b{city_kw}\b", testo_str, re.IGNORECASE):
                 comune = city_kw
@@ -813,16 +819,71 @@ def parser_proforma_professionista(testo):
     }
 
 
-def _separa_blocchi_fornitore_cliente(blocchi_spaziali: list, testo_completo: str):
+def _cerca_valore_in_celle(celle_visive: list, label_regex: str, value_regex: str, max_dist_x: float = 420.0) -> str:
+    if not celle_visive:
+        return ""
+    pat_lbl = re.compile(label_regex, re.IGNORECASE)
+    pat_val = re.compile(value_regex, re.IGNORECASE)
+
+    for p_idx, x0, y0, x1, y1, txt in reversed(celle_visive):
+        if not pat_lbl.search(txt):
+            continue
+        m_same = pat_val.search(pat_lbl.sub("", txt, count=1))
+        if m_same:
+            return m_same.group(1).strip()
+
+        sotto_cand = []
+        destra_cand = []
+        for p2, ax0, ay0, ax1, ay1, atxt in celle_visive:
+            if p2 != p_idx:
+                continue
+            if 0 < (ay0 - y0) <= 50 and ax1 >= (x0 - 20) and ax0 <= (x1 + 20):
+                sotto_cand.append((ay0 - y0, atxt))
+            elif abs(ay0 - y0) <= 10 and 0 < (ax0 - x1) <= max_dist_x:
+                destra_cand.append((ax0 - x1, atxt))
+
+        for _, cand_txt in sorted(destra_cand) + sorted(sotto_cand):
+            m_v = pat_val.search(cand_txt)
+            if m_v:
+                return m_v.group(1).strip()
+    return ""
+
+
+def _cerca_importo_in_celle(celle_visive: list, label_regex: str, prendi_ultimo: bool = False) -> float:
+    if not celle_visive:
+        return 0.0
+    pat_lbl = re.compile(label_regex, re.IGNORECASE)
+    pat_num = re.compile(r"(\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{2})|\d+[.,]\d{2})(?!\s*%)")
+
+    for p_idx, x0, y0, x1, y1, txt in reversed(celle_visive):
+        if not pat_lbl.search(txt):
+            continue
+        destra = []
+        for p2, ax0, ay0, ax1, ay1, atxt in celle_visive:
+            if p2 == p_idx and abs(ay0 - y0) <= 10 and ax0 >= (x1 - 5):
+                for m in pat_num.finditer(atxt):
+                    destra.append((ax0 + m.start(), pulisci_cifra(m.group(1))))
+        if destra:
+            destra.sort(key=lambda item: item[0])
+            return destra[-1][1] if prendi_ultimo else destra[0][1]
+    return 0.0
+
+
+def _separa_blocchi_fornitore_cliente(blocchi_spaziali: list, testo_completo: str, has_foreign_vat: bool = False):
+    delivery_re = re.compile(
+        r"\b(adresse\s+de\s+livraison|shipping\s+address|delivery\s+address|ship\s+to|consegna\s+presso)\b",
+        re.IGNORECASE,
+    )
     buyer_marker_re = re.compile(
-        r"\b(bill\s*to|billed\s*to|sold\s*to|ship\s*to|customer|client|buyer|recipient|"
+        r"\b(bill\s*to|billed\s*to|sold\s*to|customer|client|buyer|recipient|"
         r"spett\.?le|spettabile|destinatario|cliente|fatturato\s*a|committente|"
-        r"rechnungsempf[äa]nger|kunde|facturer\s*[àa]|cliente\s*final)\b",
+        r"titolare(?:/i)?\s+del\s+contratto|rechnungsempf[äa]nger|kunde|facturer\s*[àa])\b",
         re.IGNORECASE,
     )
     seller_marker_re = re.compile(
         r"\b(from|seller|supplier|vendor|issuer|billed\s*by|issued\s*by|remit\s*to|"
-        r"fornitore|cedente|mittente|verk[äa]ufer|lieferant|fournisseur|emisor)\b",
+        r"fornitore|cedente|mittente|verk[äa]ufer|lieferant|fournisseur|emisor|"
+        r"servizio\s+post\s+vendita|soci[ée]t[ée]\s+par\s+actions|siret|n[°o]\s*intracom)\b",
         re.IGNORECASE,
     )
     company_suffix_re = re.compile(
@@ -836,21 +897,24 @@ def _separa_blocchi_fornitore_cliente(blocchi_spaziali: list, testo_completo: st
 
     for b in blocchi_spaziali:
         txt = b.strip()
-        if not txt:
+        if not txt or delivery_re.search(txt):
             continue
+
         is_known_buyer = any(p in txt for p in KNOWN_BUYER_PIVAS) or bool(re.search(r"\bcasazen\b", txt, re.IGNORECASE))
-        if is_known_buyer or buyer_marker_re.search(txt):
+        is_it_block = has_foreign_vat and bool(re.search(r"\b(italia|italy|italie|IT\d{11})\b", txt, re.IGNORECASE)) and not re.search(r"\b(france|francia|germany|ireland|spain|uk|netherlands)\b", txt, re.IGNORECASE)
+
+        if is_known_buyer or is_it_block or buyer_marker_re.search(txt):
             if not blocco_buyer:
                 blocco_buyer = txt
-            elif is_known_buyer and not any(p in blocco_buyer for p in KNOWN_BUYER_PIVAS):
+            elif (re.search(r"\d{5}", txt) or len(txt) > len(blocco_buyer)) and not re.search(r"per\s+contattarci", txt, re.IGNORECASE):
                 blocco_buyer = txt
         elif seller_marker_re.search(txt) or (company_suffix_re.search(txt) and not re.search(r"\b(total|subtotal|invoice|tax|vat\s+\d+%)\b", txt, re.IGNORECASE)):
             if not blocco_seller:
                 blocco_seller = txt
 
     if not blocco_seller and blocchi_spaziali:
-        for b in blocchi_spaziali[:10]:
-            if b != blocco_buyer and len(b.strip()) > 10 and not re.search(r"^(invoice|fattura|page|\d+/\d+)$", b.strip(), re.IGNORECASE):
+        for b in blocchi_spaziali[:12]:
+            if b != blocco_buyer and not delivery_re.search(b) and len(b.strip()) > 10 and not re.search(r"^(invoice|fattura|facture|page|\d+/\d+)$", b.strip(), re.IGNORECASE):
                 blocco_seller = b.strip()
                 break
 
@@ -866,18 +930,20 @@ def _separa_blocchi_fornitore_cliente(blocchi_spaziali: list, testo_completo: st
     return blocco_seller, blocco_buyer
 
 
-def _estrai_nome_azienda_da_blocco(blocco: str, default: str = "") -> str:
+def _estrai_nome_azienda_da_blocco(blocco: str, testo_completo: str = "", default: str = "", is_seller: bool = False) -> str:
     if not blocco:
         return default
     righe = [r.strip() for r in blocco.split("\n") if len(r.strip()) > 1]
     noise_re = re.compile(
         r"^(bill\s*to|billed\s*to|sold\s*to|ship\s*to|from|seller|supplier|vendor|customer|client|"
-        r"spett\.?le|spettabile|destinatario|invoice|fattura|tax\s*invoice|page\s*\d+)[:\s]*$",
+        r"spett\.?le|spettabile|destinatario|invoice|fattura|facture|tax\s*invoice|page\s*\d+|"
+        r"per\s+contattarci|servizio\s+post\s+vendita.*|riferimento.*|contratto.*|bene.*|@.*)$",
         re.IGNORECASE,
     )
+    legal_only_re = re.compile(r"^(soci[ée]t[ée]\s+par\s+actions|societ[àa]\s+per\s+azioni|limited\s+liability)", re.IGNORECASE)
     company_suffix_re = re.compile(
         r"\b(s\.?r\.?l\.?|s\.?p\.?a\.?|s\.?a\.?s\.?|s\.?n\.?c\.?|ltd\.?|limited|inc\.?|"
-        r"llc|corp\.?|gmbh|ag|b\.?v\.?|n\.?v\.?|s\.?a\.?|s\.?l\.?|sarl|eurl|oy|ab|aps|a/s|kft|sp\.?\s*z\s*o\.?o\.?|pte)\b",
+        r"llc|corp\.?|gmbh|ag|b\.?v\.?|n\.?v\.?|s\.?a\.?|s\.?l\.?|sarl|eurl|oy|ab|aps|a/s|kft|sp\.?\s*z\s*o\.?o\.?|pte|finance)\b",
         re.IGNORECASE,
     )
     filtrate = []
@@ -890,25 +956,28 @@ def _estrai_nome_azienda_da_blocco(blocco: str, default: str = "") -> str:
         ).strip()
         if not r_clean or noise_re.match(r_clean):
             continue
-        if re.search(r"^(vat|p\.?\s*iva|tax\s*id|ein|tel|phone|email|http|www\.)", r_clean, re.IGNORECASE):
+        if re.search(r"^(vat|p\.?\s*iva|tax\s*id|ein|tel|tél|phone|fax|email|e-mail|http|www\.|siret|rc\s*:|capital|n°\s*intracom)", r_clean, re.IGNORECASE):
             continue
         filtrate.append(r_clean)
 
+    if is_seller and filtrate and legal_only_re.match(filtrate[0]) and testo_completo:
+        m_dom = re.search(r"[\w.\-]+@([a-z0-9\-]+)\.[a-z]{2,}", testo_completo, re.IGNORECASE)
+        if m_dom and m_dom.group(1).lower() not in {"gmail", "yahoo", "hotmail", "outlook", "pec", "libero"}:
+            return m_dom.group(1).replace("-", " ").upper()
+
     for r in filtrate:
-        if company_suffix_re.search(r):
+        if company_suffix_re.search(r) and not legal_only_re.match(r):
             return r[:80]
     return filtrate[0][:80] if filtrate else default
 
 
-def _estrai_importi_multilingua(testo_ricerca: str):
-    """
-    Cerca Imponibile, Imposta, Aliquota e Totale sia sulla stessa riga che nelle righe immediatamente
-    successive (fino a 60 caratteri, utile quando etichetta e valore sono impilati verticalmente).
-    """
+def _estrai_importi_multilingua(testo_ricerca: str, celle_visive: list = None):
+    if celle_visive is None:
+        celle_visive = []
+
     pat_num = r"(?:EUR|USD|GBP|CHF|[€$£])?\s*(\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{2})|\d+[.,]\d{2})(?!\s*%)\s*(?:EUR|USD|GBP|CHF|[€$£])?"
 
     def cerca_importo(labels_regex: str) -> float:
-        # 1. Prima cerca sulla stessa riga
         pat_same = rf"(?:{labels_regex})[^\n\d]{{0,45}}{pat_num}"
         matches = list(re.finditer(pat_same, testo_ricerca, re.IGNORECASE))
         for m in reversed(matches):
@@ -916,8 +985,7 @@ def _estrai_importi_multilingua(testo_ricerca: str):
             if val > 0:
                 return val
 
-        # 2. Poi cerca anche andando a capo (etichetta sopra, importo sotto)
-        pat_multi = rf"(?:{labels_regex})[\s\S]{{0,60}}?{pat_num}"
+        pat_multi = rf"(?:{labels_regex})[\s\S]{{0,65}}?{pat_num}"
         matches_m = list(re.finditer(pat_multi, testo_ricerca, re.IGNORECASE))
         for m in reversed(matches_m):
             val = pulisci_cifra(m.group(1))
@@ -926,16 +994,21 @@ def _estrai_importi_multilingua(testo_ricerca: str):
         return 0.0
 
     lbl_imp = (
-        r"Total\s+excl\.?\s*(?:VAT|Tax)|Total\s+excluding\s+(?:VAT|Tax)|"
+        r"Total\s+HT\s+Net|Total\s+excl\.?\s*(?:VAT|Tax)|Total\s+excluding\s+(?:VAT|Tax)|"
         r"Taxable\s+(?:Amount|Basis|Value)|Net\s+(?:Amount|Total|merce)|"
         r"Sub[-\s]?total|Total\s+HT|Montant\s+HT|Nettobetrag|Zwischensumme|Summe\s+netto|"
         r"Base\s+imponible|Totale\s+Imponibile|Tot\.?\s*Imp\.?|Imponibile"
     )
     imponibile = cerca_importo(lbl_imp)
+    if imponibile == 0.0:
+        imponibile = _cerca_importo_in_celle(celle_visive, rf"^(?:{lbl_imp})$", prendi_ultimo=False)
+    if imponibile == 0.0:
+        imponibile = _cerca_importo_in_celle(celle_visive, r"^(?:Totale|Total)$", prendi_ultimo=False)
 
     lbl_tax = (
         r"Total\s+(?:VAT|Tax|TVA|MwSt|IVA)|Amount\s+of\s+(?:VAT|Tax)|"
-        r"(?:VAT|Tax|Sales\s+Tax)\s+Amount|Sales\s+Tax|Imposta\s+IVA|Tot\.?\s*IVA|Totale\s+IVA|"
+        r"Importo\s+della\s+tassa(?:\s+in\s*€)?|(?:VAT|Tax|Sales\s+Tax)\s+Amount|Sales\s+Tax|"
+        r"Imposta\s+IVA|Tot\.?\s*IVA|Totale\s+IVA|"
         r"(?:VAT|TVA|MwSt\.?|USt\.?|BTW|IVA)\s*\(\s*\d+(?:[.,]\d+)?\s*%\s*\)|"
         r"(?:VAT|TVA|MwSt\.?|IVA)\s+\d{1,2}(?:[.,]\d+)?%|"
         r"(?:^|\n)\s*(?:VAT|TVA|MwSt\.?|USt\.?|BTW|Tax|IVA)(?!\s*(?:ID|No|Number|Reg|Code))"
@@ -951,18 +1024,26 @@ def _estrai_importi_multilingua(testo_ricerca: str):
     if m_aliq:
         aliquota = pulisci_cifra(m_aliq.group(1))
 
-    lbl_tot = (
-        r"Grand\s+Total|Total\s+(?:Amount\s+)?Due|Amount\s+(?:Due|Payable)|Balance\s+Due|"
-        r"Total\s+Payable|Invoice\s+Total|Total\s+incl\.?\s*(?:VAT|Tax)|Total\s+including\s+(?:VAT|Tax)|"
-        r"Total\s+TTC|Montant\s+TTC|Net\s+[àa]\s+payer|"
-        r"Gesamtbetrag|Rechnungsbetrag|Bruttobetrag|Endbetrag|Zahlbetrag|"
-        r"Total\s+a\s+pagar|Importo\s+totale|Totale\s+Documento|Totale\s+Fattura|"
-        r"Netto\s+a\s+pagare|Totale\s+dovuto|Totale\s+da\s+pagare|"
-        r"(?<!Sub)(?<!Sub-)(?<!Sub\s)\bTotal\b\s*(?:\((?:EUR|USD|GBP|CHF)\))?"
+    lbl_tot_primario = (
+        r"Total\s+TTC|Grand\s+Total|Invoice\s+Total|Total\s+incl\.?\s*(?:VAT|Tax)|Total\s+including\s+(?:VAT|Tax)|"
+        r"Montant\s+TTC|Gesamtbetrag|Rechnungsbetrag|Bruttobetrag|Endbetrag|"
+        r"Importo\s+totale|Totale\s+Documento|Totale\s+Fattura"
     )
-    totale = cerca_importo(lbl_tot)
+    totale = cerca_importo(lbl_tot_primario)
+    if totale == 0.0:
+        totale = _cerca_importo_in_celle(celle_visive, rf"^(?:{lbl_tot_primario})$", prendi_ultimo=True)
 
-    # Fallback intelligente: se non trova le parole chiave, cerca importi con simbolo valuta esplicito nella parte finale
+    if totale == 0.0:
+        lbl_tot_sec = (
+            r"Total\s+(?:Amount\s+)?Due|Amount\s+(?:Due|Payable)|Balance\s+Due|Total\s+Payable|"
+            r"Net\s+[àa]\s+payer|Zahlbetrag|Total\s+a\s+pagar|Netto\s+a\s+pagare|Totale\s+dovuto|Totale\s+da\s+pagare|"
+            r"(?<!Sub)(?<!Sub-)(?<!Sub\s)\bTotale\b|"
+            r"(?<!Sub)(?<!Sub-)(?<!Sub\s)\bTotal\b\s*(?:\((?:EUR|USD|GBP|CHF)\))?"
+        )
+        totale = cerca_importo(lbl_tot_sec)
+        if totale == 0.0:
+            totale = _cerca_importo_in_celle(celle_visive, r"^(?:Totale|Total|Net\s+[àa]\s+payer.*)$", prendi_ultimo=True)
+
     if totale == 0.0:
         tail = testo_ricerca[-2500:]
         valori_valuta = []
@@ -977,7 +1058,6 @@ def _estrai_importi_multilingua(testo_ricerca: str):
         if valori_valuta:
             totale = valori_valuta[-1]
             if imponibile == 0.0:
-                # Verifica se esiste una coppia (imponibile, imposta) la cui somma fa totale
                 trovato = False
                 for i in range(len(valori_valuta) - 1):
                     for j in range(i + 1, len(valori_valuta) - 1):
@@ -992,11 +1072,11 @@ def _estrai_importi_multilingua(testo_ricerca: str):
                     imponibile = valori_valuta[-2]
 
     valuta = "EUR"
-    if re.search(r"\bUSD\b|\$", testo_ricerca) and not re.search(r"\bEUR\b|€", testo_ricerca):
+    if re.search(r"\bUSD\b|\$", testo_ricerca) and not re.search(r"\bEUR\b|\bEUROS\b|€", testo_ricerca, re.IGNORECASE):
         valuta = "USD"
-    elif re.search(r"\bGBP\b|£", testo_ricerca) and not re.search(r"\bEUR\b|€", testo_ricerca):
+    elif re.search(r"\bGBP\b|£", testo_ricerca) and not re.search(r"\bEUR\b|\bEUROS\b|€", testo_ricerca, re.IGNORECASE):
         valuta = "GBP"
-    elif re.search(r"\bCHF\b", testo_ricerca) and not re.search(r"\bEUR\b|€", testo_ricerca):
+    elif re.search(r"\bCHF\b", testo_ricerca) and not re.search(r"\bEUR\b|\bEUROS\b|€", testo_ricerca, re.IGNORECASE):
         valuta = "CHF"
 
     m_rit = re.search(
@@ -1009,28 +1089,37 @@ def _estrai_importi_multilingua(testo_ricerca: str):
     return imponibile, imposta, aliquota, totale, ritenuta, valuta
 
 
-def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spaziali: list = None):
+def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spaziali: list = None, celle_visive: list = None):
     if not testo_visuale:
         testo_visuale = testo
     if blocchi_spaziali is None:
         blocchi_spaziali = [b for b in testo.split("\n\n") if b.strip()]
-
-    blocco_seller, blocco_buyer = _separa_blocchi_fornitore_cliente(blocchi_spaziali, testo_visuale)
+    if celle_visive is None:
+        celle_visive = []
 
     vat_list = estrai_vat_ids(testo_visuale)
+    has_foreign_vat = any(p != "IT" for p, _, _, _ in vat_list)
+
+    blocco_seller, blocco_buyer = _separa_blocchi_fornitore_cliente(
+        blocchi_spaziali, testo_visuale, has_foreign_vat=has_foreign_vat
+    )
+
     ced_paese, ced_piva = "", ""
+    ced_is_group = False
     cess_paese, cess_piva = "IT", ""
 
-    for paese, cod, _pos in vat_list:
+    for paese, cod, _pos, is_grp in vat_list:
         if cod in KNOWN_BUYER_PIVAS or (paese == "IT" and blocco_buyer and cod in blocco_buyer):
             if not cess_piva:
                 cess_paese, cess_piva = "IT", cod
         elif paese != "IT":
-            if not ced_piva:
-                ced_paese, ced_piva = paese, cod
+            if not ced_piva or (ced_is_group and not is_grp):
+                ced_paese, ced_piva, ced_is_group = paese, cod, is_grp
         else:
-            if not ced_piva:
+            if not has_foreign_vat and not ced_piva:
                 ced_paese, ced_piva = "IT", cod
+            elif has_foreign_vat and not cess_piva:
+                cess_paese, cess_piva = "IT", cod
 
     if ced_piva in KNOWN_BUYER_PIVAS:
         cess_paese, cess_piva = "IT", ced_piva
@@ -1045,53 +1134,79 @@ def parser_commerciale_dinamico(testo: str, testo_visuale: str = "", blocchi_spa
     if not ced_paese:
         ced_paese = rileva_paese_da_blocco(testo_visuale, "IT")
 
-    ced_nome = _estrai_nome_azienda_da_blocco(blocco_seller, "FORNITORE")
+    ced_nome = _estrai_nome_azienda_da_blocco(blocco_seller, testo_visuale, "FORNITORE", is_seller=True)
     ced_via, ced_cap, ced_com, ced_prov = estrai_indirizzo_cap_comune(blocco_seller, ced_paese)
 
-    cess_nome = _estrai_nome_azienda_da_blocco(blocco_buyer, "CASAZEN S.R.L.")
+    cess_nome = _estrai_nome_azienda_da_blocco(blocco_buyer, testo_visuale, "CLIENTE", is_seller=False)
     cess_via, cess_cap, cess_com, cess_prov = estrai_indirizzo_cap_comune(blocco_buyer, cess_paese)
 
     if not cess_piva and re.search(r"\bcasazen\b", testo_visuale, re.IGNORECASE):
         cess_piva = "09847131217"
 
-    num_doc = "1"
-    m_nd = re.search(
-        r"(?:Invoice\s*(?:Number|No\.?|#|ID)|Tax\s*Invoice\s*(?:No\.?|#)|Document\s*(?:No\.?|Number)|"
-        r"Rechnungsnummer|Rechnung\s*(?:Nr\.?|Nummer)|Facture\s*(?:N[°o]|Num[ée]ro)|Factura\s*(?:N[°o]|N[úu]mero)|"
-        r"Fattura\s*(?:nr?\.?|numero|n\.?)|Doc\.?\s*(?:nr?\.?|n\.?))"
-        r"[\s:–#-]*([A-Za-z0-9][A-Za-z0-9/\-_.]{0,25})",
-        testo_visuale,
-        re.IGNORECASE,
+    num_doc = _cerca_valore_in_celle(
+        celle_visive,
+        r"^(?:Facture|Fattura|Invoice)\s*(?:N[°oº.]?|Nr\.?|Number|Num[ée]ro|#)$",
+        r"\b([A-Za-z0-9][A-Za-z0-9/\-_.]{1,24})\b",
     )
-    if m_nd:
-        val_n = m_nd.group(1).strip()
-        if val_n.lower() not in {"date", "data", "elettronica", "ordinaria", "proforma", "differita", "total", "eur", "usd"}:
-            num_doc = val_n
+    if not num_doc:
+        m_nd = re.search(
+            r"(?:Invoice\s*(?:Number|No\.?|#|ID)|Tax\s*Invoice\s*(?:No\.?|#)|Document\s*(?:No\.?|Number)|"
+            r"Rechnungsnummer|Rechnung\s*(?:Nr\.?|Nummer)|Facture\s*(?:N[°oº.]?|Num[ée]ro)|Factura\s*(?:N[°oº.]?|N[úu]mero)|"
+            r"Fattura\s*(?:N[°oº.]?|nr?\.?|numero|n\.?)|Doc\.?\s*(?:nr?\.?|n\.?))"
+            r"[\s:–#-]*([A-Za-z0-9][A-Za-z0-9/\-_.]{0,25})",
+            testo_visuale,
+            re.IGNORECASE,
+        )
+        if m_nd:
+            val_n = m_nd.group(1).strip()
+            if val_n.lower() not in {"date", "data", "del", "canone", "elettronica", "ordinaria", "proforma", "differita", "total", "eur", "usd"}:
+                num_doc = val_n
+    if not num_doc:
+        num_doc = "1"
 
     prefer_us = ced_paese == "US"
     data_doc = ""
-    m_dt_lbl = re.search(
-        r"(?:Invoice\s*Date|Date\s*of\s*Issue|Issue\s*Date|Billing\s*Date|Rechnungsdatum|Date\s*de\s*facture|Fecha\s*de\s*factura|Data\s*(?:fattura|documento)?)[\s:–-]*([^\n]{6,30})",
-        testo_visuale,
-        re.IGNORECASE,
+    dt_cell = _cerca_valore_in_celle(
+        celle_visive,
+        r"^(?:Date|Invoice\s*Date|Data\s*di\s*fatturazione|Data\s*(?:fattura|documento)?)$",
+        r"(.{6,25})",
     )
-    if m_dt_lbl:
-        data_doc = parse_data_universale(m_dt_lbl.group(1), prefer_us=prefer_us)
+    if dt_cell:
+        data_doc = parse_data_universale(dt_cell, prefer_us=prefer_us)
+
+    if not data_doc:
+        m_dt_lbl = re.search(
+            r"(?:Invoice\s*Date|Date\s*of\s*Issue|Issue\s*Date|Billing\s*Date|Rechnungsdatum|Date\s*de\s*facture|Fecha\s*de\s*factura|Data\s*di\s*fatturazione|Data\s*(?:fattura|documento)?)[\s:–-]*([^\n]{6,30})",
+            testo_visuale,
+            re.IGNORECASE,
+        )
+        if m_dt_lbl:
+            data_doc = parse_data_universale(m_dt_lbl.group(1), prefer_us=prefer_us)
     if not data_doc:
         data_doc = parse_data_universale(testo_visuale, prefer_us=prefer_us) or datetime.today().strftime("%Y-%m-%d")
 
     data_scad = data_doc
-    m_scad_lbl = re.search(
-        r"(?:Due\s*Date|Payment\s*Due|F[äa]lligkeitsdatum|Date\s*d'[ée]ch[ée]ance|Fecha\s*de\s*vencimiento|Data\s*scadenza(?:\s*pagamento)?)[\s:–-]*([^\n]{6,30})",
-        testo_visuale,
-        re.IGNORECASE,
+    scad_cell = _cerca_valore_in_celle(
+        celle_visive,
+        r"^(?:Ech[ée]ance|Due\s*Date|Scadenza(?:\s*Pagamento)?)$",
+        r"(.{6,25})",
     )
-    if m_scad_lbl:
-        scad_parsed = parse_data_universale(m_scad_lbl.group(1), prefer_us=prefer_us)
-        if scad_parsed:
-            data_scad = scad_parsed
+    if scad_cell:
+        scad_p = parse_data_universale(scad_cell, prefer_us=prefer_us)
+        if scad_p:
+            data_scad = scad_p
+    else:
+        m_scad_lbl = re.search(
+            r"(?:Due\s*Date|Payment\s*Due|Ech[ée]ance|F[äa]lligkeitsdatum|Date\s*d'[ée]ch[ée]ance|Fecha\s*de\s*vencimiento|Data\s*scadenza(?:\s*pagamento)?|Scadenza)[\s:–-]*([^\n]{6,30})",
+            testo_visuale,
+            re.IGNORECASE,
+        )
+        if m_scad_lbl:
+            scad_parsed = parse_data_universale(m_scad_lbl.group(1), prefer_us=prefer_us)
+            if scad_parsed:
+                data_scad = scad_parsed
 
-    imponibile, imposta, aliquota, totale, ritenuta, valuta = _estrai_importi_multilingua(testo_visuale)
+    imponibile, imposta, aliquota, totale, ritenuta, valuta = _estrai_importi_multilingua(testo_visuale, celle_visive=celle_visive)
     if imponibile == 0.0 and totale > 0.0 and imposta == 0.0:
         imponibile = totale
 
@@ -1166,46 +1281,74 @@ def _rileva_mime_type(file_bytes: bytes, filename: str) -> str:
     }.get(ext, "application/pdf")
 
 
-def _ricostruisci_righe_visive(page) -> str:
-    """Ricostruisce le righe esattamente come sono allineate visivamente nella pagina PDF."""
+def _estrai_celle_e_righe(page, page_idx: int):
     words = page.get_text("words") or []
     if not words:
-        return page.get_text("text") or ""
+        return [], page.get_text("text") or ""
 
-    righe = []
-    # Raggruppa parole con coordinata verticale simile (tolleranza 5 pt)
-    words_sorted = sorted(words, key=lambda w: (round(w[1] / 5.0), w[0]))
+    words_sorted = sorted(words, key=lambda w: (round(w[1] / 6.0), w[0]))
+    righe_txt = []
+    celle = []
     curr_y = None
     curr_line = []
+
+    def flush_line(line_words):
+        line_words.sort(key=lambda w: w[0])
+        righe_txt.append(" ".join(w[4] for w in line_words))
+        curr_cell = [line_words[0]]
+        for w in line_words[1:]:
+            if (w[0] - curr_cell[-1][2]) > 14.0:
+                celle.append((
+                    page_idx,
+                    curr_cell[0][0],
+                    min(x[1] for x in curr_cell),
+                    curr_cell[-1][2],
+                    max(x[3] for x in curr_cell),
+                    " ".join(x[4] for x in curr_cell),
+                ))
+                curr_cell = [w]
+            else:
+                curr_cell.append(w)
+        celle.append((
+            page_idx,
+            curr_cell[0][0],
+            min(x[1] for x in curr_cell),
+            curr_cell[-1][2],
+            max(x[3] for x in curr_cell),
+            " ".join(x[4] for x in curr_cell),
+        ))
+
     for w in words_sorted:
-        y, txt = w[1], w[4]
-        if curr_y is None or abs(y - curr_y) <= 5.0:
-            curr_line.append((w[0], txt))
+        if curr_y is None or abs(w[1] - curr_y) <= 6.0:
+            curr_line.append(w)
             if curr_y is None:
-                curr_y = y
+                curr_y = w[1]
         else:
-            curr_line.sort(key=lambda item: item[0])
-            righe.append(" ".join(item[1] for item in curr_line))
-            curr_y = y
-            curr_line = [(w[0], txt)]
+            flush_line(curr_line)
+            curr_y = w[1]
+            curr_line = [w]
     if curr_line:
-        curr_line.sort(key=lambda item: item[0])
-        righe.append(" ".join(item[1] for item in curr_line))
-    return "\n".join(righe)
+        flush_line(curr_line)
+
+    return celle, "\n".join(righe_txt)
 
 
 def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
     pagine_testo = []
     pagine_visuali = []
     blocchi_spaziali = []
+    celle_visive = []
     doc = None
 
     try:
         if mime_type == "application/pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for page in doc:
+            for p_idx, page in enumerate(doc):
                 pagine_testo.append(page.get_text("text") or "")
-                pagine_visuali.append(_ricostruisci_righe_visive(page))
+                celle_p, righe_visive_p = _estrai_celle_e_righe(page, p_idx)
+                celle_visive.extend(celle_p)
+                pagine_visuali.append(righe_visive_p)
+
                 blocks = page.get_text("blocks") or []
                 blocks_sorted = sorted(blocks, key=lambda b: (round(b[1] / 25), b[0]))
                 for b in blocks_sorted:
@@ -1255,7 +1398,7 @@ def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
         except Exception:
             pass
 
-    return testo_unito, testo_visuale, blocchi_spaziali
+    return testo_unito, testo_visuale, blocchi_spaziali, celle_visive
 
 
 def _renderizza_pagine_immagini(file_bytes: bytes, mime_type: str, max_pages: int = 6):
@@ -1282,22 +1425,37 @@ def _renderizza_pagine_immagini(file_bytes: bytes, mime_type: str, max_pages: in
     return immagini
 
 
+def _parse_ai_json_text(raw_txt: str):
+    if not raw_txt:
+        return None
+    s = raw_txt.strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    m_json = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", s)
+    if m_json:
+        s = m_json.group(1)
+    data = json.loads(s)
+    if isinstance(data, list) and data:
+        data = data[0]
+    return data if isinstance(data, dict) else None
+
+
 def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type: str, testo_estratto: str = ""):
+    import urllib.request
+
     k = str(api_key).strip()
+    immagini = _renderizza_pagine_immagini(file_bytes, mime_type, max_pages=6)
 
     prompt_universale = (
         "Sei un esperto contabile specializzato in fatturazione elettronica italiana (FPR12 SdI) e fatture estere (UE ed Extra-UE). "
-        "Analizza TUTTE le pagine della fattura allegata, qualunque sia il layout grafico o la lingua (EN, DE, FR, ES, IT, NL, ecc.).\n"
+        "Analizza visivamente TUTTE le pagine della fattura allegata (inclusi loghi grafici, riquadri e tabelle finali), qualunque sia la lingua (EN, FR, DE, ES, IT, ecc.).\n"
         "REGOLE CRITICHE:\n"
-        "1. CEDENTE (cedente_*): è SEMPRE il fornitore/emittente che emette la fattura.\n"
-        "2. CESSIONARIO (cessionario_*): è SEMPRE il cliente/destinatario ('Bill To', 'Customer', 'Spett.le', 'Destinatario', es. CASAZEN s.r.l. IT09847131217). NON invertire mai fornitore e cliente!\n"
-        "3. CODICI PAESE ISO-2: usa sempre ISO 3166-1 alpha-2 (GB per Regno Unito invece di UK, GR per Grecia, IE, DE, FR, US, NL, CH). "
-        "In cedente_piva metti solo il codice identificativo senza duplicare il prefisso Paese.\n"
-        "4. IMPORTI E DATE: date in YYYY-MM-DD, numeri float con punto decimale (es. 1250.50). "
-        "Se IVA/VAT è 0 o Reverse Charge -> imposta=0.0, aliquota_prevalente=0.0, natura='N3.2' (intra-UE) o 'N2.2' (extra-UE). "
-        "Se la fattura estera espone IVA/VAT -> riporta imponibile, aliquota_prevalente, imposta e totale_documento reali.\n"
-        "5. PAGINE MULTIPLE: cerca anagrafica/numero/data in tutte le pagine e totali/IVA/IBAN/scadenza anche nelle ultime pagine e nei piè di pagina.\n"
-        "Rispondi ESCLUSIVAMENTE con un JSON valido (oggetto singolo, non lista) con queste chiavi esatte:\n"
+        "1. CEDENTE (cedente_*): è SEMPRE il fornitore estero o italiano che EMETTE la fattura (leggi anche il nome dentro eventuali loghi grafici se non ripetuto nel testo). Se sono presenti più Partite IVA nel piè di pagina (es. Gruppo IVA vs società emittente) scegli quella specifica del fornitore, NON codici SEPA tipo FR75ZZZ...\n"
+        "2. CESSIONARIO (cessionario_*): è SEMPRE l'acquirente/cliente intestatario della fattura (ignora eventuali 'Adresse de livraison' / 'Ship to' diversi dal cliente intestatario). Collega al cliente la sua P.IVA anche se si trova in un riquadro separato ('ID TVA', 'Référence client', ecc.).\n"
+        "3. CODICI PAESE ISO-2: usa ISO 3166-1 alpha-2 (GB per Regno Unito, GR per Grecia, FR, DE, IE, US, IT...). In cedente_piva e cessionario_piva metti il codice senza prefisso Paese duplicato.\n"
+        "4. QUADRATURA IMPORTI: date in YYYY-MM-DD, numeri float con punto decimale. Se sono presenti spese accessorie/trasporto ('Total HT Net' / 'Total TTC') e acconti già versati ('Acompte' / 'Deposit' / 'Net à payer'), usa come imponibile il totale imponibile netto della fattura ('Total HT Net') e come totale_documento il 'Total TTC' così che imponibile + imposta == totale_documento. Se IVA/VAT è 0 o esente/reverse charge -> imposta=0.0, aliquota_prevalente=0.0, natura='N3.2' (intra-UE) o 'N2.2' (extra-UE).\n"
+        "5. PAGINE MULTIPLE: la pagina 1 può essere solo una lettera accompagnatoria e i dati fiscali/tabella possono trovarsi a pagina 2 o nell'ultima pagina.\n"
+        "Rispondi ESCLUSIVAMENTE con un JSON valido (oggetto singolo) con queste chiavi esatte:\n"
         "cedente_denominazione, cedente_paese, cedente_piva, cedente_cf, cedente_indirizzo, cedente_cap, cedente_comune, cedente_provincia, "
         "cessionario_denominazione, cessionario_paese, cessionario_piva, cessionario_cf, cessionario_indirizzo, cessionario_cap, cessionario_comune, cessionario_provincia, "
         "numero_documento, data_documento, tipo_documento, imponibile, aliquota_prevalente, imposta, ritenuta, totale_documento, natura, iban, data_scadenza, modalita_pagamento, valuta, descrizione."
@@ -1305,12 +1463,9 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
 
     if k.startswith("sk-"):
         try:
-            import urllib.request
-
-            immagini = _renderizza_pagine_immagini(file_bytes, mime_type, max_pages=6)
             content_parts = [{"type": "text", "text": prompt_universale}]
             if testo_estratto:
-                content_parts.append({"type": "text", "text": f"Testo estratto:\n{testo_estratto[:12000]}"})
+                content_parts.append({"type": "text", "text": f"Testo di supporto:\n{testo_estratto[:12000]}"})
             for m_type, raw_bytes in immagini:
                 b64 = base64.b64encode(raw_bytes).decode("utf-8")
                 content_parts.append({
@@ -1333,54 +1488,55 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
             )
             with urllib.request.urlopen(req, timeout=45) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
-                return json.loads(res["choices"][0]["message"]["content"]), None, "OpenAI Vision GPT-4o-mini"
+                return _parse_ai_json_text(res["choices"][0]["message"]["content"]), None, "OpenAI Vision GPT-4o-mini"
         except Exception as e:
             return None, str(e), None
+
+    modelli = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    ultimo_errore = "Errore Gemini Vision"
+
+    for m_name in modelli:
+        try:
+            parts = [{"text": prompt_universale}]
+            for mt, raw_b in immagini:
+                parts.append({"inline_data": {"mime_type": mt, "data": base64.b64encode(raw_b).decode("utf-8")}})
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={k}",
+                data=json.dumps({
+                    "contents": [{"parts": parts}],
+                    "generationConfig": {"temperature": 0.0},
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                txt_out = res["candidates"][0]["content"]["parts"][0]["text"]
+                data = _parse_ai_json_text(txt_out)
+                if data:
+                    return data, None, f"{m_name} Vision"
+        except Exception as ex:
+            ultimo_errore = str(ex)
+            continue
 
     try:
         import google.generativeai as genai
 
         genai.configure(api_key=k)
-        modelli = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
-        ]
-        payload_pdf = [prompt_universale, {"mime_type": mime_type, "data": file_bytes}]
-        ultimo_errore = "Nessun modello Gemini disponibile"
-
         for m_name in modelli:
-            for usa_payload_immagini in (False, True):
-                if usa_payload_immagini and mime_type != "application/pdf":
-                    continue
-                try:
-                    model = genai.GenerativeModel(m_name)
-                    if not usa_payload_immagini:
-                        payload = payload_pdf
-                    else:
-                        imgs = _renderizza_pagine_immagini(file_bytes, mime_type, max_pages=6)
-                        payload = [prompt_universale] + [{"mime_type": mt, "data": b} for mt, b in imgs]
+            try:
+                model = genai.GenerativeModel(m_name)
+                payload = [prompt_universale] + [{"mime_type": mt, "data": b} for mt, b in immagini]
+                res = model.generate_content(payload, request_options={"timeout": 45.0})
+                data = _parse_ai_json_text(res.text or "")
+                if data:
+                    return data, None, m_name
+            except Exception as ex:
+                ultimo_errore = str(ex)
+                continue
+    except Exception as ex:
+        ultimo_errore = str(ex)
 
-                    res = model.generate_content(payload, request_options={"timeout": 45.0})
-                    raw_txt = (res.text or "").strip()
-                    raw_txt = re.sub(r"^```(?:json)?\s*", "", raw_txt)
-                    raw_txt = re.sub(r"\s*```$", "", raw_txt)
-                    m_json = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw_txt)
-                    if m_json:
-                        raw_txt = m_json.group(1)
-                    data = json.loads(raw_txt)
-                    if isinstance(data, list) and data:
-                        data = data[0]
-                    if isinstance(data, dict):
-                        return data, None, m_name
-                except Exception as ex:
-                    ultimo_errore = str(ex)
-                    continue
-
-        return None, f"Gemini AI: {ultimo_errore[:140]}", None
-    except Exception as e:
-        return None, str(e), None
+    return None, f"Gemini AI non riuscita: {ultimo_errore[:140]}", None
 
 
 def estrai_dati_fattura(file_input, filename="fattura.pdf", api_key=None):
@@ -1394,7 +1550,7 @@ def estrai_dati_fattura(file_input, filename="fattura.pdf", api_key=None):
             file_bytes = f.read()
 
     mime_type = _rileva_mime_type(file_bytes, filename)
-    testo_unito, testo_visuale, blocchi_spaziali = _estrai_testo_e_blocchi(file_bytes, mime_type)
+    testo_unito, testo_visuale, blocchi_spaziali, celle_visive = _estrai_testo_e_blocchi(file_bytes, mime_type)
     t_lower = testo_unito.lower()
 
     ai_err = None
@@ -1433,8 +1589,8 @@ def estrai_dati_fattura(file_input, filename="fattura.pdf", api_key=None):
         testo_unito,
         testo_visuale=testo_visuale or testo_unito,
         blocchi_spaziali=blocchi_spaziali,
+        celle_visive=celle_visive,
     )
     dati_ok = _ponte_chiavi_e_quadratura(dati_gen)
-    metodo = "Parser Commerciale Dinamico"
-    return dati_ok, metodo, testo_visuale or testo_unito, ai_err
+    return dati_ok, "Parser Commerciale Dinamico 2D", testo_visuale or testo_unito, ai_err
 # === FINE FILE extractor.py ===
