@@ -1,9 +1,7 @@
 # === INIZIO FILE xml_generator.py ===
 """
 xml_generator.py - VERSIONE CERTIFICATA AdE / TEAMSYSTEM ECONS / CONSPAY
-Supporta fatture italiane (comportamento congelato invariato) ed estere (conforme XSD SdI v1.2.2).
-- Ordine DatiRiepilogo conforme XSD AdE: AliquotaIVA, Natura, ImponibileImporto, Imposta, RiferimentoNormativo.
-- Validazione rigida dei codici enumerati TipoDocumento (TD01..TD29), ModalitaPagamento (MP01..MP23), Natura, IBAN.
+Supporta fatture italiane (invariate), fatture estere e fatture con acconto (CONSPAY).
 """
 
 from datetime import datetime
@@ -32,10 +30,6 @@ VALID_NATURA = {
 
 
 def _pulisci_testo_econs(val, default="", max_len: int = None) -> str:
-    """
-    Rimuove caratteri di controllo ASCII non ammessi, tronca PRIMA dell'escape (se richiesto)
-    ed esegue l'escape XML per AdE / ECONS senza mai spezzare entità XML.
-    """
     if val is None or str(val).strip() == "" or str(val).strip().lower() == "none":
         testo_pulito = str(default)
     else:
@@ -101,7 +95,6 @@ def _norm_natura(val, ced_paese: str) -> str:
 
 
 def genera_nome_file_sdi(data: dict = None, progressivo: str = "00001") -> str:
-    """Genera la nomenclatura ministeriale: IT[P.IVA_Trasmittente]_[PROG5].xml"""
     if not isinstance(data, dict):
         data = {}
 
@@ -121,7 +114,7 @@ def genera_xml_teamsystem(data=None) -> str:
     if not isinstance(data, dict):
         data = {}
 
-    # 1. CEDENTE / PRESTATORE (Fornitore)
+    # 1. CEDENTE / PRESTATORE
     ced_paese = _norm_paese_sdi(
         data.get("cedente_paese") or data.get("fornitore_nazione") or "IT", "IT"
     )
@@ -168,7 +161,7 @@ def genera_xml_teamsystem(data=None) -> str:
         max_len=60,
     )
 
-    # 2. CESSIONARIO / COMMITTENTE (Cliente)
+    # 2. CESSIONARIO / COMMITTENTE
     cess_paese = _norm_paese_sdi(
         data.get("cessionario_paese") or data.get("cliente_nazione") or "IT", "IT"
     )
@@ -222,10 +215,7 @@ def genera_xml_teamsystem(data=None) -> str:
         or data.get("data")
         or datetime.today().strftime("%Y-%m-%d")
     ).strip()[:10]
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_doc_raw):
-        data_doc = datetime.today().strftime("%Y-%m-%d")
-    else:
-        data_doc = data_doc_raw
+    data_doc = data_doc_raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_doc_raw) else datetime.today().strftime("%Y-%m-%d")
 
     tipo_doc = _norm_tipo_documento(data.get("tipo_documento"))
     descrizione = _pulisci_testo_econs(
@@ -255,6 +245,11 @@ def genera_xml_teamsystem(data=None) -> str:
     except (ValueError, TypeError):
         ritenuta = 0.0
 
+    try:
+        acconto = round(float(data.get("acconto", 0.0) or 0.0), 2)
+    except (ValueError, TypeError):
+        acconto = 0.0
+
     if aliquota == 0.0:
         imposta = 0.00
     else:
@@ -265,14 +260,163 @@ def genera_xml_teamsystem(data=None) -> str:
             imposta = round(imposta_in, 2)
 
     totale_lordo = round(imponibile + imposta, 2)
-    tot_input = float(data.get("totale_documento") or data.get("totale") or 0.0 or 0.0)
+    try:
+        tot_input = float(data.get("totale_documento") or data.get("totale") or 0.0 or 0.0)
+    except (ValueError, TypeError):
+        tot_input = 0.0
+
     if tot_input > 0 and abs(tot_input - totale_lordo) <= 0.02:
         totale = tot_input
     else:
         totale = totale_lordo
 
-    netto_a_pagare = round(totale - ritenuta, 2)
+    netto_a_pagare = round(max(0.0, totale - ritenuta - acconto), 2)
 
     # 6. CONSPAY TEAMSYSTEM
     iban_raw = str(data.get("iban") or "")
-    iban_clean = re.sub
+    iban_clean = re.sub(r"[^A-Za-z0-9]", "", iban_raw).upper()
+    iban_valido = bool(re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", iban_clean))
+
+    data_scad_raw = str(data.get("data_scadenza") or data.get("scadenza") or data_doc).strip()[:10]
+    data_scad = data_scad_raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_scad_raw) else data_doc
+    metodo_pag = _norm_modalita_pagamento(
+        data.get("modalita_pagamento") or data.get("metodo_pagamento")
+    )
+
+    # 7. SCHEMA AD ALBERO ECONS / SDI (ORDINE XSD v1.2.2 ESATTO)
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<p:FatturaElettronica xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" versione="FPR12">',
+        "  <FatturaElettronicaHeader>",
+        "    <DatiTrasmissione>",
+        "      <IdTrasmittente>",
+        f"        <IdPaese>{id_trasm_paese}</IdPaese>",
+        f"        <IdCodice>{id_trasm_codice}</IdCodice>",
+        "      </IdTrasmittente>",
+        f"      <ProgressivoInvio>{prog_invio}</ProgressivoInvio>",
+        "      <FormatoTrasmissione>FPR12</FormatoTrasmissione>",
+        "      <CodiceDestinatario>0000000</CodiceDestinatario>",
+        "    </DatiTrasmissione>",
+        "    <CedentePrestatore>",
+        "      <DatiAnagrafici>",
+        "        <IdFiscaleIVA>",
+        f"          <IdPaese>{ced_paese}</IdPaese>",
+        f"          <IdCodice>{ced_piva}</IdCodice>",
+        "        </IdFiscaleIVA>",
+        "        <Anagrafica>",
+        f"          <Denominazione>{ced_nome}</Denominazione>",
+        "        </Anagrafica>",
+        "        <RegimeFiscale>RF01</RegimeFiscale>",
+        "      </DatiAnagrafici>",
+        "      <Sede>",
+        f"        <Indirizzo>{ced_via}</Indirizzo>",
+        f"        <CAP>{ced_cap}</CAP>",
+        f"        <Comune>{ced_com}</Comune>",
+        f"        <Nazione>{ced_paese}</Nazione>",
+        "      </Sede>",
+        "    </CedentePrestatore>",
+        "    <CessionarioCommittente>",
+        "      <DatiAnagrafici>",
+        "        <IdFiscaleIVA>",
+        f"          <IdPaese>{cess_paese}</IdPaese>",
+        f"          <IdCodice>{cess_piva}</IdCodice>",
+        "        </IdFiscaleIVA>",
+        "        <Anagrafica>",
+        f"          <Denominazione>{cess_nome}</Denominazione>",
+        "        </Anagrafica>",
+        "      </DatiAnagrafici>",
+        "      <Sede>",
+        f"        <Indirizzo>{cess_via}</Indirizzo>",
+        f"        <CAP>{cess_cap}</CAP>",
+        f"        <Comune>{cess_com}</Comune>",
+        f"        <Nazione>{cess_paese}</Nazione>",
+        "      </Sede>",
+        "    </CessionarioCommittente>",
+        "  </FatturaElettronicaHeader>",
+        "  <FatturaElettronicaBody>",
+        "    <DatiGenerali>",
+        "      <DatiGeneraliDocumento>",
+        f"        <TipoDocumento>{tipo_doc}</TipoDocumento>",
+        "        <Divisa>EUR</Divisa>",
+        f"        <Data>{data_doc}</Data>",
+        f"        <Numero>{num_doc}</Numero>",
+    ]
+
+    if ritenuta > 0:
+        xml_lines.extend([
+            "        <DatiRitenuta>",
+            "          <TipoRitenuta>RT01</TipoRitenuta>",
+            f"          <ImportoRitenuta>{ritenuta:.2f}</ImportoRitenuta>",
+            "          <AliquotaRitenuta>20.00</AliquotaRitenuta>",
+            "          <CausalePagamento>A</CausalePagamento>",
+            "        </DatiRitenuta>",
+        ])
+
+    xml_lines.extend([
+        f"        <ImportoTotaleDocumento>{totale:.2f}</ImportoTotaleDocumento>",
+        "      </DatiGeneraliDocumento>",
+        "    </DatiGenerali>",
+        "    <DatiBeniServizi>",
+        "      <DettaglioLinee>",
+        "        <NumeroLinea>1</NumeroLinea>",
+        f"        <Descrizione>{descrizione}</Descrizione>",
+        f"        <PrezzoUnitario>{imponibile:.2f}</PrezzoUnitario>",
+        f"        <PrezzoTotale>{imponibile:.2f}</PrezzoTotale>",
+        f"        <AliquotaIVA>{aliquota:.2f}</AliquotaIVA>",
+    ])
+
+    nat_val = ""
+    if aliquota == 0.0:
+        nat_val = _norm_natura(data.get("natura"), ced_paese)
+        xml_lines.append(f"        <Natura>{nat_val}</Natura>")
+
+    xml_lines.extend([
+        "      </DettaglioLinee>",
+        "      <DatiRiepilogo>",
+        f"        <AliquotaIVA>{aliquota:.2f}</AliquotaIVA>",
+    ])
+
+    if aliquota == 0.0:
+        xml_lines.append(f"        <Natura>{nat_val}</Natura>")
+
+    xml_lines.extend([
+        f"        <ImponibileImporto>{imponibile:.2f}</ImponibileImporto>",
+        f"        <Imposta>{imposta:.2f}</Imposta>",
+    ])
+
+    if aliquota == 0.0:
+        ref_norm = (
+            "Operazione non imponibile art. 41"
+            if nat_val == "N3.2"
+            else "Operazione non soggetta"
+        )
+        xml_lines.append(f"        <RiferimentoNormativo>{ref_norm}</RiferimentoNormativo>")
+
+    xml_lines.extend([
+        "      </DatiRiepilogo>",
+        "    </DatiBeniServizi>",
+        "    <DatiPagamento>",
+        "      <CondizioniPagamento>TP02</CondizioniPagamento>",
+        "      <DettaglioPagamento>",
+        f"        <ModalitaPagamento>{metodo_pag}</ModalitaPagamento>",
+        f"        <DataScadenzaPagamento>{data_scad}</DataScadenzaPagamento>",
+        f"        <ImportoPagamento>{netto_a_pagare:.2f}</ImportoPagamento>",
+    ])
+
+    if iban_valido:
+        xml_lines.append(f"        <IBAN>{iban_clean}</IBAN>")
+
+    xml_lines.extend([
+        "      </DettaglioPagamento>",
+        "    </DatiPagamento>",
+        "  </FatturaElettronicaBody>",
+        "</p:FatturaElettronica>",
+    ])
+
+    return "\n".join(xml_lines)
+
+
+generate_sdi_xml = genera_xml_teamsystem
+genera_xml = genera_xml_teamsystem
+genera_nome_file_xml = genera_nome_file_sdi
+# === FINE FILE xml_generator.py ===
