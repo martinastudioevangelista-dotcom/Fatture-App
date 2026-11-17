@@ -1,14 +1,22 @@
 # === INIZIO FILE extractor.py ===
 """
-extractor.py - VERSIONE UNIVERSALE ITALIA + ESTERO (AUTO-DISCOVERY GEMINI + ACCONTI + CELLE 2D)
+extractor.py - VERSIONE VELOCE + UNIVERSALE ITALIA & ESTERO
+- Cache modelli Gemini (una sola interrogazione ListModels per sessione).
+- Thread-safe per lettura parallela di più fatture contemporaneamente.
+- Precedenza ai parser italiani deterministici istantanei (<0.05s), Vision AI per tutto il resto.
 """
 
 import base64
 from datetime import datetime
 import json
 import re
+import threading
 import fitz  # PyMuPDF
 
+
+_FITZ_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+_GEMINI_MODELS_CACHE = {}
 
 KNOWN_BUYER_PIVAS = {"09847131217"}
 
@@ -1395,49 +1403,50 @@ def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
     pagine_visuali = []
     blocchi_spaziali = []
     celle_visive = []
-    doc = None
 
-    try:
-        if mime_type == "application/pdf":
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for p_idx, page in enumerate(doc):
-                pagine_testo.append(page.get_text("text") or "")
-                celle_p, righe_visive_p = _estrai_celle_e_righe(page, p_idx)
-                celle_visive.extend(celle_p)
-                pagine_visuali.append(righe_visive_p)
+    with _FITZ_LOCK:
+        doc = None
+        try:
+            if mime_type == "application/pdf":
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                for p_idx, page in enumerate(doc):
+                    pagine_testo.append(page.get_text("text") or "")
+                    celle_p, righe_visive_p = _estrai_celle_e_righe(page, p_idx)
+                    celle_visive.extend(celle_p)
+                    pagine_visuali.append(righe_visive_p)
 
-                raw_blocks = [
-                    b for b in (page.get_text("blocks") or [])
-                    if len(b) >= 5 and isinstance(b[4], str) and b[4].strip()
-                ]
-                raw_blocks.sort(key=lambda b: (round(b[1] / 25), b[0]))
+                    raw_blocks = [
+                        b for b in (page.get_text("blocks") or [])
+                        if len(b) >= 5 and isinstance(b[4], str) and b[4].strip()
+                    ]
+                    raw_blocks.sort(key=lambda b: (round(b[1] / 25), b[0]))
 
-                merged_blocks = []
-                for b in raw_blocks:
-                    bx0, by0, bx1, by1, btxt = b[0], b[1], b[2], b[3], b[4].strip()
-                    unito = False
-                    for i in range(len(merged_blocks) - 1, -1, -1):
-                        mx0, my0, mx1, my1, mtxt = merged_blocks[i]
-                        if abs(bx0 - mx0) <= 35 and 0 <= (by0 - my1) <= 35:
-                            merged_blocks[i] = (
-                                min(mx0, bx0), my0, max(mx1, bx1), by1, mtxt + "\n" + btxt
-                            )
-                            unito = True
-                            break
-                    if not unito:
-                        merged_blocks.append((bx0, by0, bx1, by1, btxt))
+                    merged_blocks = []
+                    for b in raw_blocks:
+                        bx0, by0, bx1, by1, btxt = b[0], b[1], b[2], b[3], b[4].strip()
+                        unito = False
+                        for i in range(len(merged_blocks) - 1, -1, -1):
+                            mx0, my0, mx1, my1, mtxt = merged_blocks[i]
+                            if abs(bx0 - mx0) <= 35 and 0 <= (by0 - my1) <= 35:
+                                merged_blocks[i] = (
+                                    min(mx0, bx0), my0, max(mx1, bx1), by1, mtxt + "\n" + btxt
+                                )
+                                unito = True
+                                break
+                        if not unito:
+                            merged_blocks.append((bx0, by0, bx1, by1, btxt))
 
-                for b in merged_blocks:
-                    blocchi_spaziali.append(b[4])
-        else:
+                    for b in merged_blocks:
+                        blocchi_spaziali.append(b[4])
+            else:
+                pagine_testo = [""]
+                pagine_visuali = [""]
+        except Exception:
             pagine_testo = [""]
             pagine_visuali = [""]
-    except Exception:
-        pagine_testo = [""]
-        pagine_visuali = [""]
-    finally:
-        if doc:
-            doc.close()
+        finally:
+            if doc:
+                doc.close()
 
     testo_unito = "\n".join(pagine_testo).strip()
     testo_visuale = "\n".join(pagine_visuali).strip()
@@ -1450,16 +1459,15 @@ def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
 
             ocr_pages = []
             if mime_type == "application/pdf":
-                doc_ocr = fitz.open(stream=file_bytes, filetype="pdf")
-                for idx, page in enumerate(doc_ocr):
-                    if idx >= 8:
-                        break
-                    pix = page.get_pixmap(dpi=200)
-                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                with _FITZ_LOCK:
+                    doc_ocr = fitz.open(stream=file_bytes, filetype="pdf")
+                    pix_list = [doc_ocr[idx].get_pixmap(dpi=160).tobytes("png") for idx in range(min(len(doc_ocr), 6))]
+                    doc_ocr.close()
+                for pb in pix_list:
+                    img = Image.open(io.BytesIO(pb))
                     txt_ocr = pytesseract.image_to_string(img, lang="ita+eng")
                     if txt_ocr.strip():
                         ocr_pages.append(txt_ocr)
-                doc_ocr.close()
             else:
                 img = Image.open(io.BytesIO(file_bytes))
                 txt_ocr = pytesseract.image_to_string(img, lang="ita+eng")
@@ -1476,27 +1484,28 @@ def _estrai_testo_e_blocchi(file_bytes: bytes, mime_type: str):
     return testo_unito, testo_visuale, blocchi_spaziali, celle_visive
 
 
-def _renderizza_pagine_immagini(file_bytes: bytes, mime_type: str, max_pages: int = 6):
+def _renderizza_pagine_immagini(file_bytes: bytes, mime_type: str, max_pages: int = 4):
     if mime_type != "application/pdf":
         return [(mime_type, file_bytes)]
 
     immagini = []
-    doc = None
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        n = len(doc)
-        if n <= max_pages:
-            indices = list(range(n))
-        else:
-            indices = [0, 1, 2, n - 3, n - 2, n - 1]
-        for idx in indices:
-            pix = doc[idx].get_pixmap(dpi=160)
-            immagini.append(("image/jpeg", pix.tobytes("jpeg")))
-    except Exception:
-        pass
-    finally:
-        if doc:
-            doc.close()
+    with _FITZ_LOCK:
+        doc = None
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            n = len(doc)
+            if n <= max_pages:
+                indices = list(range(n))
+            else:
+                indices = [0, 1, n - 2, n - 1]
+            for idx in indices:
+                pix = doc[idx].get_pixmap(dpi=130)
+                immagini.append(("image/jpeg", pix.tobytes("jpeg")))
+        except Exception:
+            pass
+        finally:
+            if doc:
+                doc.close()
     return immagini
 
 
@@ -1519,6 +1528,10 @@ def _scopri_modelli_gemini(api_key: str):
     import urllib.request
     import urllib.error
 
+    with _CACHE_LOCK:
+        if api_key in _GEMINI_MODELS_CACHE:
+            return _GEMINI_MODELS_CACHE[api_key], None
+
     fallback = [
         "models/gemini-2.5-flash",
         "models/gemini-2.0-flash",
@@ -1527,7 +1540,7 @@ def _scopri_modelli_gemini(api_key: str):
     ]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        with urllib.request.urlopen(url, timeout=15) as resp:
+        with urllib.request.urlopen(url, timeout=12) as resp:
             info = json.loads(resp.read().decode("utf-8"))
         attivi = []
         for m in info.get("models", []):
@@ -1556,7 +1569,11 @@ def _scopri_modelli_gemini(api_key: str):
             return 5
 
         attivi.sort(key=score)
-        return (attivi[:6] if attivi else fallback), None
+        scelti = attivi[:4] if attivi else fallback
+        if attivi:
+            with _CACHE_LOCK:
+                _GEMINI_MODELS_CACHE[api_key] = scelti
+        return scelti, None
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", errors="ignore")
@@ -1572,7 +1589,7 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
     import urllib.error
 
     k = str(api_key).strip()
-    immagini = _renderizza_pagine_immagini(file_bytes, mime_type, max_pages=6)
+    immagini = _renderizza_pagine_immagini(file_bytes, mime_type, max_pages=4)
 
     prompt_universale = (
         "Sei un esperto contabile specializzato in fatturazione elettronica italiana (FPR12 SdI) e fatture estere (UE ed Extra-UE). "
@@ -1592,7 +1609,7 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
         try:
             content_parts = [{"type": "text", "text": prompt_universale}]
             if testo_estratto:
-                content_parts.append({"type": "text", "text": f"Testo di supporto:\n{testo_estratto[:12000]}"})
+                content_parts.append({"type": "text", "text": f"Testo di supporto:\n{testo_estratto[:10000]}"})
             for m_type, raw_bytes in immagini:
                 b64 = base64.b64encode(raw_bytes).decode("utf-8")
                 content_parts.append({
@@ -1613,7 +1630,7 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
                     "Authorization": f"Bearer {k}",
                 },
             )
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=35) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 return _parse_ai_json_text(res["choices"][0]["message"]["content"]), None, "OpenAI Vision GPT-4o-mini"
         except Exception as e:
@@ -1638,7 +1655,7 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=35) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 txt_out = res["candidates"][0]["content"]["parts"][0]["text"]
                 data = _parse_ai_json_text(txt_out)
@@ -1674,18 +1691,7 @@ def estrai_dati_fattura(file_input, filename="fattura.pdf", api_key=None):
     testo_unito, testo_visuale, blocchi_spaziali, celle_visive = _estrai_testo_e_blocchi(file_bytes, mime_type)
     t_lower = testo_unito.lower()
 
-    ai_err = None
-    if api_key and len(str(api_key).strip()) > 8:
-        dati_ai, err_ai, mod_name = _chiama_ai_vision(
-            file_bytes, filename, str(api_key).strip(), mime_type, testo_visuale or testo_unito
-        )
-        if dati_ai and isinstance(dati_ai, dict) and (
-            dati_ai.get("cedente_denominazione") or dati_ai.get("totale_documento")
-        ):
-            dati_ok = _ponte_chiavi_e_quadratura(dati_ai)
-            return dati_ok, f"Vision AI ({mod_name})", testo_visuale or testo_unito, None
-        ai_err = err_ai
-
+    # 1. Parser italiani istantanei (<0.05s, zero chiamate AI inutili)
     if "dati del cedente" in t_lower and "dati del cessionario" in t_lower:
         dati_sdi = parser_foglio_stile_sdi(testo_unito)
         dati_ok = _ponte_chiavi_e_quadratura(dati_sdi)
@@ -1706,6 +1712,20 @@ def estrai_dati_fattura(file_input, filename="fattura.pdf", api_key=None):
         dati_ok = _ponte_chiavi_e_quadratura(dati_prof)
         return dati_ok, "Parser Proforma Professionisti", testo_unito, None
 
+    # 2. Vision AI (per tutte le fatture estere, scansioni, immagini, layout complessi)
+    ai_err = None
+    if api_key and len(str(api_key).strip()) > 8:
+        dati_ai, err_ai, mod_name = _chiama_ai_vision(
+            file_bytes, filename, str(api_key).strip(), mime_type, testo_visuale or testo_unito
+        )
+        if dati_ai and isinstance(dati_ai, dict) and (
+            dati_ai.get("cedente_denominazione") or dati_ai.get("totale_documento")
+        ):
+            dati_ok = _ponte_chiavi_e_quadratura(dati_ai)
+            return dati_ok, f"Vision AI ({mod_name})", testo_visuale or testo_unito, None
+        ai_err = err_ai
+
+    # 3. Fallback Parser Commerciale Dinamico 2D
     dati_gen = parser_commerciale_dinamico(
         testo_unito,
         testo_visuale=testo_visuale or testo_unito,
