@@ -1,5 +1,5 @@
 # === INIZIO FILE app.py ===
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY (v3.1 Multi-Fattura Batch)
 import io
 import zipfile
 import pandas as pd
@@ -60,9 +60,9 @@ except Exception:
     GDRIVE_OK = False
     def upload_to_drive(*args, **kwargs): return False, "Drive non attivo"
 
-for k in ["invoice_data", "xml_content", "xml_filename", "last_file_id", "validation_report", "gdrive_status", "motore_usato", "testo_grezzo", "errore_ai", "xml_aggiornato"]:
+for k in ["invoice_cache", "batch_order", "selected_fid"]:
     if k not in st.session_state:
-        st.session_state[k] = None
+        st.session_state[k] = {} if k == "invoice_cache" else ([] if k == "batch_order" else None)
 
 with st.sidebar:
     st.title("⚙️ Impostazioni")
@@ -78,23 +78,9 @@ with st.sidebar:
     salva_drive = st.checkbox("Archivia su Google Drive", value=False)
 
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Fatturazione FPR12 v1.2.2 - Tracciato ministeriale certificato per Agenzia delle Entrate e TeamSystem.")
+st.caption("Fatturazione FPR12 v1.2.2 - Caricamento singolo o multiplo certificato per Agenzia delle Entrate e TeamSystem.")
 
-# ---------------------------------------------------------
-# FASE 1: CARICAMENTO DOCUMENTO
-# ---------------------------------------------------------
-col_up1, col_up2 = st.columns([4, 1])
-with col_up1:
-    uploaded_file = st.file_uploader(
-        "Carica fattura (PDF, Immagine, XML nativo o firmato .P7M)", 
-        type=["pdf", "png", "jpg", "jpeg", "xml", "p7m"]
-    )
-with col_up2:
-    st.write("")
-    st.write("")
-    force_reparse = st.button("🔄 Rianalizza Documento", help="Rilegge il file azzerando la cache.")
-
-def genera_payload_e_xml(dati_dict, cod_dest_val):
+def genera_payload_e_xml(dati_dict, cod_dest_val, prog_idx=1):
     ced_p = dati_dict.get("cedente_paese", "IT") or "IT"
     cess_p = dati_dict.get("cessionario_piva", "")
     aliq = float(dati_dict.get("aliquota_prevalente", 22.0 if ced_p == "IT" else 0.0))
@@ -146,51 +132,184 @@ def genera_payload_e_xml(dati_dict, cod_dest_val):
     piva_trasm = str(cess_p or ("09847131217" if ced_p != "IT" else "00000000000")).strip().upper()
     if piva_trasm.startswith("IT") and len(piva_trasm) == 13:
         piva_trasm = piva_trasm[2:]
-    nome_file = f"IT{piva_trasm}_00001.xml"
+    nome_file = f"IT{piva_trasm}_{prog_idx:05d}.xml"
     return xml_str, nome_file, payload
 
-if uploaded_file is not None:
-    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
-    if st.session_state["last_file_id"] != file_id or force_reparse:
-        nome_f = uploaded_file.name.lower()
-        with st.status("Acquisizione documento e generazione iniziale XML...", expanded=True) as status:
-            file_bytes = uploaded_file.read()
-            uploaded_file.seek(0)
-            
+# ---------------------------------------------------------
+# FASE 1: CARICAMENTO MULTIPLO DOCUMENTI
+# ---------------------------------------------------------
+col_up1, col_up2 = st.columns([4, 1])
+with col_up1:
+    uploaded_files = st.file_uploader(
+        "Carica una o più fatture insieme (PDF, Immagini, XML o firmati .P7M)",
+        type=["pdf", "png", "jpg", "jpeg", "xml", "p7m"],
+        accept_multiple_files=True
+    )
+with col_up2:
+    st.write("")
+    st.write("")
+    force_reparse = st.button("🔄 Rianalizza Tutto", help="Rilegge tutti i file caricati azzerando la cache.")
+
+if not uploaded_files:
+    st.session_state["batch_order"] = []
+    st.info("👆 Carica una o più fatture (puoi selezionarne anche tante insieme) per iniziare.")
+    st.stop()
+
+if force_reparse:
+    st.session_state["invoice_cache"] = {}
+
+nuovi_fids = []
+da_elaborare = []
+for idx, f in enumerate(uploaded_files, start=1):
+    fid = f"{idx}_{f.name}_{f.size}"
+    nuovi_fids.append(fid)
+    if fid not in st.session_state["invoice_cache"]:
+        da_elaborare.append((idx, fid, f))
+
+if da_elaborare:
+    with st.status(f"Elaborazione di {len(da_elaborare)} fattura/e in corso...", expanded=True) as status:
+        prog_bar = st.progress(0)
+        tot_el = len(da_elaborare)
+        for step, (idx, fid, f) in enumerate(da_elaborare, start=1):
+            st.write(f"📄 Lettura {step}/{tot_el}: **{f.name}**")
+            f.seek(0)
+            file_bytes = f.read()
+            f.seek(0)
+            nome_f = f.name.lower()
+
             if nome_f.endswith(".xml") or nome_f.endswith(".p7m"):
-                dati, motore, testo_raw, err_ai = leggi_xml_fattura(file_bytes, uploaded_file.name)
+                dati, motore, testo_raw, err_ai = leggi_xml_fattura(file_bytes, f.name)
             else:
-                dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, uploaded_file.name, api_key=api_key_input)
-            
-            st.session_state["invoice_data"] = dati
-            st.session_state["motore_usato"] = motore
-            st.session_state["testo_grezzo"] = testo_raw
-            st.session_state["errore_ai"] = err_ai
-            st.session_state["last_file_id"] = file_id
-            
-            xml_str_init, nome_xml_init, payload_init = genera_payload_e_xml(dati, codice_dest_default)
-            st.session_state["xml_content"] = xml_str_init
-            st.session_state["xml_filename"] = nome_xml_init
-            
+                dati, motore, testo_raw, err_ai = estrai_dati_fattura(file_bytes, f.name, api_key=api_key_input)
+
+            xml_str_init, nome_xml_init, payload_init = genera_payload_e_xml(dati, codice_dest_default, prog_idx=idx)
             ok_init, errs_init = valida_quadratura_fiscale(
                 payload_init["riepilogo_iva"], payload_init["totale_documento"], ritenuta=payload_init["ritenuta"]
             )
-            st.session_state["validation_report"] = (ok_init, errs_init)
-            
-            status.update(label=f"✅ Elaborato con successo: {motore}", state="complete", expanded=False)
-        st.rerun()
+            ced_piva_i = str(dati.get("cedente_piva") or "")
+            ced_paese_i = str(dati.get("cedente_paese") or "IT")
+            if ced_piva_i and not valida_partita_iva(ced_piva_i, ced_paese_i):
+                errs_init.append(f"P.IVA Fornitore '{ced_piva_i}' ({ced_paese_i}) da verificare.")
 
-if st.session_state["invoice_data"] is None:
-    st.info("👆 Carica una fattura per visualizzare i dati.")
-    st.stop()
+            st.session_state["invoice_cache"][fid] = {
+                "idx": idx,
+                "fid": fid,
+                "orig_filename": f.name,
+                "orig_bytes": file_bytes,
+                "invoice_data": dati,
+                "motore_usato": motore,
+                "testo_grezzo": testo_raw,
+                "errore_ai": err_ai,
+                "xml_content": xml_str_init,
+                "xml_filename": nome_xml_init,
+                "validation_report": (ok_init and len(errs_init) == 0, errs_init),
+                "xml_aggiornato": False,
+            }
+            prog_bar.progress(step / tot_el)
 
-inv = st.session_state["invoice_data"]
+        status.update(label=f"✅ Elaborazione completata ({tot_el} fatture lette)", state="complete", expanded=False)
+    st.rerun()
 
-if st.session_state.get("motore_usato"):
-    st.caption(f"⚙️ Motore utilizzato: **{st.session_state['motore_usato']}**")
+st.session_state["batch_order"] = nuovi_fids
+batch_items = [st.session_state["invoice_cache"][fid] for fid in nuovi_fids]
 
-if st.session_state.get("errore_ai"):
-    st.warning(f"⚠️ Avviso: {st.session_state['errore_ai']}")
+# ---------------------------------------------------------
+# RIEPILOGO E DOWNLOAD MASSIVO (SEMPRE VISIBILE CON >= 1 FATTURA)
+# ---------------------------------------------------------
+if len(batch_items) > 1:
+    st.markdown(f"### 📚 Riepilogo Fatture Caricate ({len(batch_items)} documenti)")
+    righe_riep = []
+    for item in batch_items:
+        d = item["invoice_data"]
+        ok_it, _ = item["validation_report"]
+        tot_d = float(d.get("totale_documento", 0.0))
+        rit_d = float(d.get("ritenuta", 0.0))
+        acc_d = float(d.get("acconto", 0.0))
+        netto_c = round(max(0.0, tot_d - rit_d - acc_d), 2)
+        righe_riep.append({
+            "#": item["idx"],
+            "File Originale": item["orig_filename"],
+            "Fornitore (Cedente)": d.get("cedente_denominazione", ""),
+            "Cliente": d.get("cessionario_denominazione", ""),
+            "N° Doc": d.get("numero_documento", ""),
+            "Data": d.get("data_documento", ""),
+            "Imponibile (€)": round(float(d.get("imponibile", 0.0)), 2),
+            "IVA (€)": round(float(d.get("imposta", 0.0)), 2),
+            "Totale AdE (€)": round(tot_d, 2),
+            "Netto CONSPAY (€)": netto_c,
+            "File XML": item["xml_filename"],
+            "Stato": "🟢 OK" if ok_it else "🟡 Verifica",
+        })
+    st.dataframe(pd.DataFrame(righe_riep), use_container_width=True, hide_index=True)
+
+    # Preparazione ZIP massivi
+    zip_only_xml = io.BytesIO()
+    zip_all_full = io.BytesIO()
+    nomi_usati_xml = set()
+    nomi_usati_pdf = set()
+    with zipfile.ZipFile(zip_only_xml, "w", zipfile.ZIP_DEFLATED) as z_xml, \
+         zipfile.ZipFile(zip_all_full, "w", zipfile.ZIP_DEFLATED) as z_full:
+        for item in batch_items:
+            x_name = item["xml_filename"]
+            if x_name in nomi_usati_xml:
+                x_name = f"{item['idx']:02d}_{x_name}"
+            nomi_usati_xml.add(x_name)
+            x_bytes = item["xml_content"].encode("utf-8")
+            z_xml.writestr(x_name, x_bytes)
+            z_full.writestr(x_name, x_bytes)
+
+            p_name = item["orig_filename"]
+            if p_name in nomi_usati_pdf:
+                p_name = f"{item['idx']:02d}_{p_name}"
+            nomi_usati_pdf.add(p_name)
+            z_full.writestr(p_name, item["orig_bytes"])
+    zip_only_xml.seek(0)
+    zip_all_full.seek(0)
+
+    cb1, cb2 = st.columns(2)
+    with cb1:
+        st.download_button(
+            label=f"📦 SCARICA TUTTI GLI XML ({len(batch_items)} file in ZIP)",
+            data=zip_only_xml.getvalue(),
+            file_name=f"Fatture_XML_{datetime.today().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+            key="btn_dl_batch_xml",
+            use_container_width=True,
+            type="primary"
+        )
+    with cb2:
+        st.download_button(
+            label=f"🗂️ SCARICA PACCHETTO COMPLETO (PDF + XML)",
+            data=zip_all_full.getvalue(),
+            file_name=f"Pacchetto_Completo_{datetime.today().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+            key="btn_dl_batch_full",
+            use_container_width=True
+        )
+
+    st.markdown("---")
+    opzioni_sel = []
+    for item in batch_items:
+        d = item["invoice_data"]
+        stato_ic = "🟢" if item["validation_report"][0] else "🟡"
+        opzioni_sel.append(
+            f"{item['idx']}) {stato_ic} {item['orig_filename']} — {d.get('cedente_denominazione', '')} ({float(d.get('totale_documento', 0.0)):.2f}€)"
+        )
+    sel_label = st.selectbox("🔎 Seleziona la fattura da controllare o modificare nel dettaglio:", opzioni_sel)
+    curr_idx_pos = opzioni_sel.index(sel_label)
+    curr_item = batch_items[curr_idx_pos]
+else:
+    curr_item = batch_items[0]
+
+curr_fid = curr_item["fid"]
+curr_idx = curr_item["idx"]
+inv = curr_item["invoice_data"]
+
+if curr_item.get("motore_usato"):
+    st.caption(f"⚙️ Motore utilizzato per **{curr_item['orig_filename']}**: **{curr_item['motore_usato']}**")
+
+if curr_item.get("errore_ai"):
+    st.warning(f"⚠️ Avviso: {curr_item['errore_ai']}")
 
 if inv.get("valuta") and str(inv.get("valuta")).upper() != "EUR":
     st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML.")
@@ -215,15 +334,16 @@ df_rep = pd.DataFrame([
         "Sede": f"{inv.get('cessionario_indirizzo', '')}, {inv.get('cessionario_cap', '')} {inv.get('cessionario_comune', '')} ({inv.get('cessionario_provincia', '')})"
     }
 ])
-st.data_editor(df_rep, use_container_width=True, disabled=True)
+st.data_editor(df_rep, use_container_width=True, disabled=True, key=f"ed_{curr_fid}")
 
-if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)"):
+if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)", key=f"inv_btn_{curr_fid}"):
     for c in ["denominazione", "paese", "piva", "cf", "indirizzo", "cap", "comune", "provincia"]:
         inv[f"cedente_{c}"], inv[f"cessionario_{c}"] = inv.get(f"cessionario_{c}", ""), inv.get(f"cedente_{c}", "")
-    st.session_state["invoice_data"] = inv
-    xml_agg, nome_agg, _ = genera_payload_e_xml(inv, codice_dest_default)
-    st.session_state["xml_content"] = xml_agg
-    st.session_state["xml_filename"] = nome_agg
+    curr_item["invoice_data"] = inv
+    xml_agg, nome_agg, _ = genera_payload_e_xml(inv, codice_dest_default, prog_idx=curr_idx)
+    curr_item["xml_content"] = xml_agg
+    curr_item["xml_filename"] = nome_agg
+    st.session_state["invoice_cache"][curr_fid] = curr_item
     st.rerun()
 
 st.markdown("---")
@@ -231,7 +351,7 @@ st.markdown("---")
 # ---------------------------------------------------------
 # FASE 3: MODULO DI REVISIONE E MODIFICA DATI
 # ---------------------------------------------------------
-with st.form("form_revisione_totale"):
+with st.form(f"form_revisione_{curr_fid}"):
     st.markdown("#### 📄 1. Estremi del Documento & Tipo Tracciato")
     cd1, cd2, cd3, cd4 = st.columns(4)
     with cd1:
@@ -390,13 +510,8 @@ if btn_submit:
     inv["iban"] = iban_doc
     inv["data_scadenza"] = scadenza_pag.strftime("%Y-%m-%d")
     inv["modalita_pagamento"] = metodo_pag
-    
-    st.session_state["invoice_data"] = inv
 
-    xml_nuovo, nome_nuovo, payload_nuovo = genera_payload_e_xml(inv, cod_sdi)
-    st.session_state["xml_content"] = xml_nuovo
-    st.session_state["xml_filename"] = nome_nuovo
-
+    xml_nuovo, nome_nuovo, payload_nuovo = genera_payload_e_xml(inv, cod_sdi, prog_idx=curr_idx)
     quadratura_ok, errs = valida_quadratura_fiscale(
         payload_nuovo["riepilogo_iva"], payload_nuovo["totale_documento"], ritenuta=payload_nuovo["ritenuta"]
     )
@@ -405,26 +520,31 @@ if btn_submit:
         segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non valida.")
     if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
         segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
-    
-    st.session_state["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
-    st.session_state["xml_aggiornato"] = True
+
+    curr_item["invoice_data"] = inv
+    curr_item["xml_content"] = xml_nuovo
+    curr_item["xml_filename"] = nome_nuovo
+    curr_item["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
+    curr_item["xml_aggiornato"] = True
+    st.session_state["invoice_cache"][curr_fid] = curr_item
+    st.rerun()
 
 # ---------------------------------------------------------
-# FASE 5: AREA DI DOWNLOAD POST-CONFERMA (SUBITO SOTTO)
+# FASE 5: AREA DI DOWNLOAD SINGOLA FATTURA SELEZIONATA
 # ---------------------------------------------------------
-if st.session_state.get("xml_content"):
+if curr_item.get("xml_content"):
     st.markdown("---")
-    st.subheader("📦 Area di Download File Conforme SdI")
-    
-    if st.session_state.get("xml_aggiornato"):
+    st.subheader(f"📦 Download Singola Fattura ({curr_item['orig_filename']})")
+
+    if curr_item.get("xml_aggiornato"):
         st.success("✅ **Modifiche salvate e XML rigenerato con successo!**")
 
-    is_ok, anomalie = st.session_state.get("validation_report") or (True, [])
-    
+    is_ok, anomalie = curr_item.get("validation_report") or (True, [])
+
     c_down1, c_down2 = st.columns([2, 1])
     with c_down1:
         if is_ok:
-            st.success(f"✅ **Quadratura e Dati Fiscali Validi**: File `{st.session_state['xml_filename']}` conforme AdE / SdI.")
+            st.success(f"✅ **Quadratura e Dati Fiscali Validi**: File `{curr_item['xml_filename']}` conforme AdE / SdI.")
         else:
             st.warning("⚠️ **Segnalazioni contabili:**")
             for a in anomalie:
@@ -432,31 +552,29 @@ if st.session_state.get("xml_content"):
 
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(st.session_state["xml_filename"], st.session_state["xml_content"].encode("utf-8"))
-        if uploaded_file is not None:
-            uploaded_file.seek(0)
-            z.writestr(uploaded_file.name, uploaded_file.read())
+        z.writestr(curr_item["xml_filename"], curr_item["xml_content"].encode("utf-8"))
+        z.writestr(curr_item["orig_filename"], curr_item["orig_bytes"])
     zip_bytes.seek(0)
 
     with c_down2:
         st.download_button(
             label="💾 SCARICA FILE XML ORA",
-            data=st.session_state["xml_content"].encode("utf-8"),
-            file_name=st.session_state["xml_filename"],
+            data=curr_item["xml_content"].encode("utf-8"),
+            file_name=curr_item["xml_filename"],
             mime="application/octet-stream",
-            key="btn_download_diretto",
+            key=f"btn_download_diretto_{curr_fid}",
             use_container_width=True,
             type="primary"
         )
         st.download_button(
             label="🗂️ SCARICA PACCHETTO ZIP (PDF + XML)",
             data=zip_bytes.getvalue(),
-            file_name=f"Fattura_{st.session_state['xml_filename'].replace('.xml', '')}.zip",
+            file_name=f"Fattura_{curr_item['xml_filename'].replace('.xml', '')}.zip",
             mime="application/zip",
-            key="btn_download_zip_diretto",
+            key=f"btn_download_zip_diretto_{curr_fid}",
             use_container_width=True
         )
 
     with st.expander("🔍 Visualizza e Copia Testo XML"):
-        st.code(st.session_state["xml_content"], language="xml")
+        st.code(curr_item["xml_content"], language="xml")
 # === FINE FILE app.py ===
