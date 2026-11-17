@@ -1,9 +1,8 @@
 # === INIZIO FILE extractor.py ===
 """
 extractor.py - VERSIONE VELOCE + UNIVERSALE ITALIA & ESTERO
-- Cache modelli Gemini (una sola interrogazione ListModels per sessione).
-- Thread-safe per lettura parallela di più fatture contemporaneamente.
-- Precedenza ai parser italiani deterministici istantanei (<0.05s), Vision AI per tutto il resto.
+- Esclude i modelli di generazione immagini/audio (-image, -tts) che causano HTTP 429.
+- Cache modelli Gemini + rotazione automatica su modelli con quota separata.
 """
 
 import base64
@@ -11,6 +10,7 @@ from datetime import datetime
 import json
 import re
 import threading
+import time
 import fitz  # PyMuPDF
 
 
@@ -1535,8 +1535,9 @@ def _scopri_modelli_gemini(api_key: str):
     fallback = [
         "models/gemini-2.5-flash",
         "models/gemini-2.0-flash",
+        "models/gemini-2.5-flash-lite",
+        "models/gemini-2.0-flash-lite",
         "models/gemini-flash-latest",
-        "models/gemini-2.5-pro",
     ]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
@@ -1549,27 +1550,37 @@ def _scopri_modelli_gemini(api_key: str):
             if "generateContent" not in methods:
                 continue
             nl = name.lower()
-            if any(bad in nl for bad in ("tts", "image-generation", "embedding", "aqa", "robotics", "computer-use")):
+            # Esclude tassativamente modelli di generazione immagini, audio, tts, embedding
+            if any(bad in nl for bad in (
+                "tts", "image", "embedding", "aqa", "robotics",
+                "computer-use", "audio", "native", "dialog", "veo", "imagen"
+            )):
                 continue
             if "gemini" in nl:
                 attivi.append(name)
 
         def score(n):
-            nl = n.lower()
-            if "2.5-flash" in nl and "lite" not in nl and "preview" not in nl:
+            nl = n.lower().replace("models/", "")
+            if nl == "gemini-2.5-flash":
                 return 0
-            if "2.0-flash" in nl and "lite" not in nl and "exp" not in nl:
+            if nl == "gemini-2.0-flash":
                 return 1
-            if "flash-latest" in nl:
+            if nl == "gemini-2.5-flash-lite":
                 return 2
-            if "flash" in nl:
+            if nl == "gemini-2.0-flash-lite":
                 return 3
-            if "2.5-pro" in nl:
+            if nl == "gemini-flash-latest":
                 return 4
-            return 5
+            if "flash" in nl and "lite" not in nl and "preview" not in nl and "exp" not in nl:
+                return 5
+            if "flash" in nl:
+                return 6
+            if nl == "gemini-2.5-pro":
+                return 7
+            return 8
 
         attivi.sort(key=score)
-        scelti = attivi[:4] if attivi else fallback
+        scelti = attivi[:6] if attivi else fallback
         if attivi:
             with _CACHE_LOCK:
                 _GEMINI_MODELS_CACHE[api_key] = scelti
@@ -1668,6 +1679,8 @@ def _chiama_ai_vision(file_bytes: bytes, filename: str, api_key: str, mime_type:
                 msg = str(he)
             if not primo_errore or ("404" in primo_errore and he.code != 404):
                 primo_errore = f"HTTP {he.code} ({m_path}): {msg[:130]}"
+            if he.code == 429:
+                time.sleep(1.0)
             continue
         except Exception as ex:
             if not primo_errore:
