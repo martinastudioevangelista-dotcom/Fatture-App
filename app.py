@@ -1,5 +1,5 @@
 # === INIZIO FILE app.py ===
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (v3.1 Multi-Fattura Batch)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY (v3.2 Multi-Fattura con Schede Espandibili)
 import io
 import zipfile
 import pandas as pd
@@ -60,9 +60,9 @@ except Exception:
     GDRIVE_OK = False
     def upload_to_drive(*args, **kwargs): return False, "Drive non attivo"
 
-for k in ["invoice_cache", "batch_order", "selected_fid"]:
+for k in ["invoice_cache", "batch_order"]:
     if k not in st.session_state:
-        st.session_state[k] = {} if k == "invoice_cache" else ([] if k == "batch_order" else None)
+        st.session_state[k] = {} if k == "invoice_cache" else []
 
 with st.sidebar:
     st.title("⚙️ Impostazioni")
@@ -134,6 +134,262 @@ def genera_payload_e_xml(dati_dict, cod_dest_val, prog_idx=1):
         piva_trasm = piva_trasm[2:]
     nome_file = f"IT{piva_trasm}_{prog_idx:05d}.xml"
     return xml_str, nome_file, payload
+
+def render_scheda_fattura(item):
+    fid = item["fid"]
+    idx = item["idx"]
+    inv = item["invoice_data"]
+
+    if item.get("motore_usato"):
+        st.caption(f"⚙️ Motore utilizzato: **{item['motore_usato']}**")
+    if item.get("errore_ai"):
+        st.warning(f"⚠️ Avviso: {item['errore_ai']}")
+    if inv.get("valuta") and str(inv.get("valuta")).upper() != "EUR":
+        st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML.")
+
+    st.markdown("#### 🔍 Soggetti Estratti")
+    df_rep = pd.DataFrame([
+        {
+            "Ruolo": "🏢 FORNITORE (Cedente)",
+            "Denominazione": inv.get("cedente_denominazione", ""),
+            "P.IVA / CF": inv.get("cedente_piva", "") or inv.get("cedente_cf", ""),
+            "Nazione": inv.get("cedente_paese", "IT"),
+            "Sede": f"{inv.get('cedente_indirizzo', '')}, {inv.get('cedente_cap', '')} {inv.get('cedente_comune', '')} ({inv.get('cedente_provincia', '')})"
+        },
+        {
+            "Ruolo": "👤 CLIENTE (Cessionario)",
+            "Denominazione": inv.get("cessionario_denominazione", ""),
+            "P.IVA / CF": inv.get("cessionario_piva", "") or inv.get("cessionario_cf", ""),
+            "Nazione": inv.get("cessionario_paese", "IT"),
+            "Sede": f"{inv.get('cessionario_indirizzo', '')}, {inv.get('cessionario_cap', '')} {inv.get('cessionario_comune', '')} ({inv.get('cessionario_provincia', '')})"
+        }
+    ])
+    st.dataframe(df_rep, use_container_width=True, hide_index=True)
+
+    if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)", key=f"inv_btn_{fid}"):
+        for c in ["denominazione", "paese", "piva", "cf", "indirizzo", "cap", "comune", "provincia"]:
+            inv[f"cedente_{c}"], inv[f"cessionario_{c}"] = inv.get(f"cessionario_{c}", ""), inv.get(f"cedente_{c}", "")
+        item["invoice_data"] = inv
+        xml_agg, nome_agg, _ = genera_payload_e_xml(inv, codice_dest_default, prog_idx=idx)
+        item["xml_content"] = xml_agg
+        item["xml_filename"] = nome_agg
+        st.session_state["invoice_cache"][fid] = item
+        st.rerun()
+
+    with st.form(f"form_rev_{fid}"):
+        st.markdown("#### 📄 1. Estremi del Documento & Tipo Tracciato")
+        cd1, cd2, cd3, cd4 = st.columns(4)
+        with cd1:
+            tipo_doc_default = str(inv.get("tipo_documento") or "TD01")
+            opzioni_td = ["TD01 - Fattura Ordinaria", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"]
+            idx_td = {"TD01": 0, "TD17": 1, "TD04": 2, "TD24": 3}.get(tipo_doc_default, 0)
+            tipo_doc = st.selectbox("Tipo Documento", opzioni_td, index=idx_td, key=f"td_{fid}").split(" - ")[0]
+        with cd2:
+            num_doc = st.text_input("Numero Documento", value=str(inv.get("numero_documento", "1")), key=f"num_{fid}")
+        with cd3:
+            try:
+                d_val = datetime.strptime(str(inv.get("data_documento", ""))[:10], "%Y-%m-%d")
+            except Exception:
+                d_val = datetime.today()
+            data_doc = st.date_input("Data Documento", value=d_val, key=f"dt_{fid}")
+        with cd4:
+            cod_sdi_val = str(inv.get("codice_destinatario", codice_dest_default))[:7]
+            cod_sdi = st.text_input("Codice Destinatario SdI", value=cod_sdi_val, max_chars=7, key=f"sdi_{fid}")
+
+        st.markdown("---")
+        st.markdown("#### 🏢 2. Anagrafiche Fiscali Segregate")
+        col_ced, col_cess = st.columns(2)
+
+        with col_ced:
+            st.markdown("**FORNITORE (Cedente / Prestatore)**")
+            ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "")), key=f"ced_nom_{fid}")
+            c_p1, c_p2, c_p3 = st.columns([1, 2, 2])
+            ced_paese_val = str(inv.get("cedente_paese") or "IT")[:2].upper()
+            ced_paese = c_p1.text_input("Nazione", value=ced_paese_val, max_chars=2, key=f"ced_pae_{fid}")
+            ced_piva = c_p2.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")), key=f"ced_piva_{fid}")
+            ced_cf = c_p3.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")), key=f"ced_cf_{fid}")
+
+            regime_fiscale_selezionato = st.selectbox(
+                "Regime Fiscale Fornitore (AdE)",
+                ["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato", "RF18 - Altro / Estero"],
+                index=3 if ced_paese != "IT" else 0,
+                key=f"reg_{fid}"
+            ).split(" - ")[0]
+
+            ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")), key=f"ced_via_{fid}")
+            ci1, ci2, ci3 = st.columns([2, 3, 1])
+            ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100"))[:12], max_chars=12, key=f"ced_cap_{fid}")
+            ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")), key=f"ced_com_{fid}")
+            ced_prov_val = str(inv.get("cedente_provincia", "RM" if ced_paese == "IT" else ""))[:2].upper()
+            ced_prov = ci3.text_input("Prov.", value=ced_prov_val, max_chars=2, key=f"ced_prov_{fid}")
+
+        with col_cess:
+            st.markdown("**CLIENTE STUDIO (Cessionario / Committente)**")
+            cess_nome = st.text_input("Denominazione Cliente", value=str(inv.get("cessionario_denominazione", "")), key=f"cess_nom_{fid}")
+            cs_p1, cs_p2, cs_p3 = st.columns([1, 2, 2])
+            cess_paese_val = str(inv.get("cessionario_paese") or "IT")[:2].upper()
+            cess_paese = cs_p1.text_input("Nazione Cliente", value=cess_paese_val, max_chars=2, key=f"cess_pae_{fid}")
+            cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")), key=f"cess_piva_{fid}")
+            cess_cf = cs_p3.text_input("Codice Fiscale Cliente", value=str(inv.get("cessionario_cf", "")), key=f"cess_cf_{fid}")
+
+            cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "")), key=f"cess_via_{fid}")
+            cs1, cs2, cs3 = st.columns([2, 3, 1])
+            cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100"))[:12], max_chars=12, key=f"cess_cap_{fid}")
+            cess_com = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")), key=f"cess_com_{fid}")
+            cess_prov_val = str(inv.get("cessionario_provincia", "RM"))[:2].upper()
+            cess_prov = cs3.text_input("Prov. Cliente", value=cess_prov_val, max_chars=2, key=f"cess_prov_{fid}")
+
+        st.markdown("---")
+        st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY")
+        cp1, cp2, cp3 = st.columns([2, 1, 1])
+        with cp1:
+            iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), key=f"iban_{fid}")
+        with cp2:
+            try:
+                d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
+            except Exception:
+                d_scad = d_val
+            scadenza_pag = st.date_input("Scadenza Pagamento", value=d_scad, key=f"scad_{fid}")
+        with cp3:
+            metodo_default = inv.get("modalita_pagamento", "MP05")
+            metodi_list = [
+                "MP05 - Bonifico Bancario",
+                "MP08 - Carta di Pagamento",
+                "MP19 - SEPA Direct Debit / Prelievo",
+                "MP12 - RiBa",
+                "MP01 - Contanti",
+            ]
+            idx_met = {"MP05": 0, "MP08": 1, "MP19": 2, "MP12": 3, "MP01": 4}.get(metodo_default, 0)
+            metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met, key=f"mp_{fid}").split(" - ")[0]
+
+        st.markdown("---")
+        st.markdown("#### 💰 4. Sezione Contabile, IVA, Ritenuta & Acconto")
+        ce1, ce2, ce3, ce4, ce5 = st.columns(5)
+        with ce1:
+            imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01, key=f"imp_{fid}")
+        with ce2:
+            aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0, key=f"aliq_{fid}")
+        with ce3:
+            imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01, key=f"iva_{fid}")
+        with ce4:
+            ritenuta_1 = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01, key=f"rit_{fid}")
+        with ce5:
+            acconto_1 = st.number_input("Acconto già versato (€)", value=float(inv.get("acconto", 0.0)), step=0.01, key=f"acc_{fid}")
+
+        col_t1, col_t2 = st.columns([3, 1])
+        with col_t1:
+            natura_default = str(inv.get("natura") or ("N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else ""))
+            natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 UE / N2.2 Extra-UE)", value=natura_default, key=f"nat_{fid}")
+        with col_t2:
+            totale_doc = st.number_input("Totale Fattura AdE (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01, key=f"tot_{fid}")
+
+        lordo_live = round(imponibile_1 + imposta_1, 2)
+        netto_rit_live = round(lordo_live - ritenuta_1, 2)
+        netto_pag_live = round(max(0.0, lordo_live - ritenuta_1 - acconto_1), 2)
+        diff_live = min(abs(netto_rit_live - totale_doc), abs(lordo_live - totale_doc))
+
+        if diff_live <= 0.02:
+            msg_q = f"🟢 **Quadratura Verificata**: {imponibile_1:.2f}€ + {imposta_1:.2f}€ = {lordo_live:.2f}€"
+            if acconto_1 > 0 or ritenuta_1 > 0:
+                msg_q += f" ➔ **Netto residuo da pagare (CONSPAY): {netto_pag_live:.2f}€**"
+            st.success(msg_q)
+        else:
+            st.warning(f"🟡 **Scostamento**: Totale calcolato {lordo_live:.2f}€ vs inserito {totale_doc:.2f}€")
+
+        btn_submit = st.form_submit_button("💾 Aggiorna Modifiche e Rigenera XML", type="primary", use_container_width=True)
+
+    if btn_submit:
+        inv["tipo_documento"] = tipo_doc
+        inv["numero_documento"] = num_doc
+        inv["data_documento"] = data_doc.strftime("%Y-%m-%d")
+        inv["codice_destinatario"] = cod_sdi
+        inv["regime_fiscale"] = regime_fiscale_selezionato
+        inv["cedente_denominazione"] = ced_nome
+        inv["cedente_paese"] = ced_paese if ced_paese else "IT"
+        inv["cedente_piva"] = ced_piva
+        inv["cedente_cf"] = ced_cf
+        inv["cedente_indirizzo"] = ced_via
+        inv["cedente_cap"] = ced_cap
+        inv["cedente_comune"] = ced_com
+        inv["cedente_provincia"] = ced_prov if ced_paese == "IT" else ""
+        inv["cessionario_denominazione"] = cess_nome
+        inv["cessionario_paese"] = cess_paese if cess_paese else "IT"
+        inv["cessionario_piva"] = cess_piva
+        inv["cessionario_cf"] = cess_cf
+        inv["cessionario_indirizzo"] = cess_via
+        inv["cessionario_cap"] = cess_cap
+        inv["cessionario_comune"] = cess_com
+        inv["cessionario_provincia"] = cess_prov
+        inv["imponibile"] = imponibile_1
+        inv["aliquota_prevalente"] = aliquota_1
+        inv["imposta"] = imposta_1
+        inv["ritenuta"] = ritenuta_1
+        inv["acconto"] = acconto_1
+        inv["totale_documento"] = totale_doc
+        inv["natura"] = natura_iva
+        inv["iban"] = iban_doc
+        inv["data_scadenza"] = scadenza_pag.strftime("%Y-%m-%d")
+        inv["modalita_pagamento"] = metodo_pag
+
+        xml_nuovo, nome_nuovo, payload_nuovo = genera_payload_e_xml(inv, cod_sdi, prog_idx=idx)
+        quadratura_ok, errs = valida_quadratura_fiscale(
+            payload_nuovo["riepilogo_iva"], payload_nuovo["totale_documento"], ritenuta=payload_nuovo["ritenuta"]
+        )
+        segnalazioni = []
+        if ced_piva and not valida_partita_iva(ced_piva, ced_paese):
+            segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non valida.")
+        if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
+            segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
+
+        item["invoice_data"] = inv
+        item["xml_content"] = xml_nuovo
+        item["xml_filename"] = nome_nuovo
+        item["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
+        item["xml_aggiornato"] = True
+        st.session_state["invoice_cache"][fid] = item
+        st.rerun()
+
+    if item.get("xml_content"):
+        if item.get("xml_aggiornato"):
+            st.success("✅ **Modifiche salvate e XML rigenerato con successo!**")
+
+        is_ok, anomalie = item.get("validation_report") or (True, [])
+        c_down1, c_down2 = st.columns([2, 1])
+        with c_down1:
+            if is_ok:
+                st.success(f"✅ **Quadratura e Dati Fiscali Validi**: `{item['xml_filename']}` conforme AdE / SdI.")
+            else:
+                st.warning("⚠️ **Segnalazioni contabili:**")
+                for a in anomalie:
+                    st.write(f"- {a}")
+
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(item["xml_filename"], item["xml_content"].encode("utf-8"))
+            z.writestr(item["orig_filename"], item["orig_bytes"])
+        zip_bytes.seek(0)
+
+        with c_down2:
+            st.download_button(
+                label="💾 SCARICA FILE XML ORA",
+                data=item["xml_content"].encode("utf-8"),
+                file_name=item["xml_filename"],
+                mime="application/octet-stream",
+                key=f"dl_xml_{fid}",
+                use_container_width=True,
+                type="primary"
+            )
+            st.download_button(
+                label="🗂️ SCARICA PACCHETTO ZIP (PDF + XML)",
+                data=zip_bytes.getvalue(),
+                file_name=f"Fattura_{item['xml_filename'].replace('.xml', '')}.zip",
+                mime="application/zip",
+                key=f"dl_zip_{fid}",
+                use_container_width=True
+            )
+
+        if st.checkbox("🔍 Mostra testo XML generato", key=f"show_xml_{fid}"):
+            st.code(item["xml_content"], language="xml")
 
 # ---------------------------------------------------------
 # FASE 1: CARICAMENTO MULTIPLO DOCUMENTI
@@ -214,7 +470,7 @@ st.session_state["batch_order"] = nuovi_fids
 batch_items = [st.session_state["invoice_cache"][fid] for fid in nuovi_fids]
 
 # ---------------------------------------------------------
-# RIEPILOGO E DOWNLOAD MASSIVO (SEMPRE VISIBILE CON >= 1 FATTURA)
+# RIEPILOGO E DOWNLOAD MASSIVO + SCHEDE MODIFICABILI
 # ---------------------------------------------------------
 if len(batch_items) > 1:
     st.markdown(f"### 📚 Riepilogo Fatture Caricate ({len(batch_items)} documenti)")
@@ -242,7 +498,6 @@ if len(batch_items) > 1:
         })
     st.dataframe(pd.DataFrame(righe_riep), use_container_width=True, hide_index=True)
 
-    # Preparazione ZIP massivi
     zip_only_xml = io.BytesIO()
     zip_all_full = io.BytesIO()
     nomi_usati_xml = set()
@@ -279,7 +534,7 @@ if len(batch_items) > 1:
         )
     with cb2:
         st.download_button(
-            label=f"🗂️ SCARICA PACCHETTO COMPLETO (PDF + XML)",
+            label="🗂️ SCARICA PACCHETTO COMPLETO (PDF + XML)",
             data=zip_all_full.getvalue(),
             file_name=f"Pacchetto_Completo_{datetime.today().strftime('%Y%m%d_%H%M')}.zip",
             mime="application/zip",
@@ -288,293 +543,18 @@ if len(batch_items) > 1:
         )
 
     st.markdown("---")
-    opzioni_sel = []
+    st.markdown("### 📝 Apri e Modifica le Singole Fatture")
+    st.caption("Clicca su una fattura qui sotto per aprire tutti i suoi campi modificabili:")
     for item in batch_items:
         d = item["invoice_data"]
-        stato_ic = "🟢" if item["validation_report"][0] else "🟡"
-        opzioni_sel.append(
-            f"{item['idx']}) {stato_ic} {item['orig_filename']} — {d.get('cedente_denominazione', '')} ({float(d.get('totale_documento', 0.0)):.2f}€)"
+        stato_ic = "🟢 OK" if item["validation_report"][0] else "🟡 Verifica"
+        titolo_exp = (
+            f"📄 {item['idx']}) {item['orig_filename']} — "
+            f"{d.get('cedente_denominazione', '')} | "
+            f"Tot: {float(d.get('totale_documento', 0.0)):.2f}€ ({stato_ic})"
         )
-    sel_label = st.selectbox("🔎 Seleziona la fattura da controllare o modificare nel dettaglio:", opzioni_sel)
-    curr_idx_pos = opzioni_sel.index(sel_label)
-    curr_item = batch_items[curr_idx_pos]
+        with st.expander(titolo_exp, expanded=(item["idx"] == 1)):
+            render_scheda_fattura(item)
 else:
-    curr_item = batch_items[0]
-
-curr_fid = curr_item["fid"]
-curr_idx = curr_item["idx"]
-inv = curr_item["invoice_data"]
-
-if curr_item.get("motore_usato"):
-    st.caption(f"⚙️ Motore utilizzato per **{curr_item['orig_filename']}**: **{curr_item['motore_usato']}**")
-
-if curr_item.get("errore_ai"):
-    st.warning(f"⚠️ Avviso: {curr_item['errore_ai']}")
-
-if inv.get("valuta") and str(inv.get("valuta")).upper() != "EUR":
-    st.warning(f"💱 **Valuta estera rilevata ({inv['valuta']})**: verifica che gli importi siano convertiti in **EUR** prima di scaricare l'XML.")
-
-# ---------------------------------------------------------
-# FASE 2: VERIFICA RAPIDA DEI SOGGETTI E INVERSIONE
-# ---------------------------------------------------------
-st.markdown("### 🔍 Verifica Soggetti Estratti (Human-in-the-Loop)")
-df_rep = pd.DataFrame([
-    {
-        "Ruolo": "🏢 FORNITORE (Cedente - I miei dati per AdE)",
-        "Denominazione": inv.get("cedente_denominazione", ""),
-        "P.IVA / CF": inv.get("cedente_piva", "") or inv.get("cedente_cf", ""),
-        "Nazione Sede": inv.get("cedente_paese", "IT"),
-        "Sede": f"{inv.get('cedente_indirizzo', '')}, {inv.get('cedente_cap', '')} {inv.get('cedente_comune', '')} ({inv.get('cedente_provincia', '')})"
-    },
-    {
-        "Ruolo": "👤 CLIENTE STUDIO (Cessionario / Committente)",
-        "Denominazione": inv.get("cessionario_denominazione", ""),
-        "P.IVA / CF": inv.get("cessionario_piva", "") or inv.get("cessionario_cf", ""),
-        "Nazione Sede": inv.get("cessionario_paese", "IT"),
-        "Sede": f"{inv.get('cessionario_indirizzo', '')}, {inv.get('cessionario_cap', '')} {inv.get('cessionario_comune', '')} ({inv.get('cessionario_provincia', '')})"
-    }
-])
-st.data_editor(df_rep, use_container_width=True, disabled=True, key=f"ed_{curr_fid}")
-
-if st.button("🔄 Inverti Fornitore e Cliente (se scambiati)", key=f"inv_btn_{curr_fid}"):
-    for c in ["denominazione", "paese", "piva", "cf", "indirizzo", "cap", "comune", "provincia"]:
-        inv[f"cedente_{c}"], inv[f"cessionario_{c}"] = inv.get(f"cessionario_{c}", ""), inv.get(f"cedente_{c}", "")
-    curr_item["invoice_data"] = inv
-    xml_agg, nome_agg, _ = genera_payload_e_xml(inv, codice_dest_default, prog_idx=curr_idx)
-    curr_item["xml_content"] = xml_agg
-    curr_item["xml_filename"] = nome_agg
-    st.session_state["invoice_cache"][curr_fid] = curr_item
-    st.rerun()
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# FASE 3: MODULO DI REVISIONE E MODIFICA DATI
-# ---------------------------------------------------------
-with st.form(f"form_revisione_{curr_fid}"):
-    st.markdown("#### 📄 1. Estremi del Documento & Tipo Tracciato")
-    cd1, cd2, cd3, cd4 = st.columns(4)
-    with cd1:
-        tipo_doc_default = str(inv.get("tipo_documento") or "TD01")
-        opzioni_td = ["TD01 - Fattura Ordinaria", "TD17 - Autofattura Estero (Invio SdI)", "TD04 - Nota di Credito", "TD24 - Fattura Differita"]
-        idx_td = {"TD01": 0, "TD17": 1, "TD04": 2, "TD24": 3}.get(tipo_doc_default, 0)
-        tipo_doc = st.selectbox("Tipo Documento", opzioni_td, index=idx_td).split(" - ")[0]
-    with cd2:
-        num_doc = st.text_input("Numero Documento", value=str(inv.get("numero_documento", "1")))
-    with cd3:
-        try:
-            d_val = datetime.strptime(str(inv.get("data_documento", ""))[:10], "%Y-%m-%d")
-        except Exception:
-            d_val = datetime.today()
-        data_doc = st.date_input("Data Documento", value=d_val)
-    with cd4:
-        cod_sdi = st.text_input("Codice Destinatario SdI", value=str(inv.get("codice_destinatario", codice_dest_default)), max_chars=7)
-
-    st.markdown("---")
-    st.markdown("#### 🏢 2. Anagrafiche Fiscali Segregate")
-    col_ced, col_cess = st.columns(2)
-    
-    with col_ced:
-        st.markdown("**FORNITORE (Cedente / Prestatore - 'I miei dati' per AdE)**")
-        ced_nome = st.text_input("Denominazione Fornitore", value=str(inv.get("cedente_denominazione", "")))
-        
-        c_p1, c_p2, c_p3 = st.columns([1, 2, 2])
-        with c_p1:
-            ced_paese = c_p1.text_input("Nazione", value=str(inv.get("cedente_paese") or "IT")[:2].upper(), max_chars=2, help="Richiesto da AdE (es. IT, FR, DE)")
-        with c_p2:
-            ced_piva = c_p2.text_input("Partita IVA Fornitore", value=str(inv.get("cedente_piva", "")))
-        with c_p3:
-            ced_cf = c_p3.text_input("Codice Fiscale Fornitore", value=str(inv.get("cedente_cf", "")))
-
-        regime_fiscale_selezionato = st.selectbox(
-            "Regime Fiscale Fornitore (Richiesto da AdE)",
-            ["RF01 - Ordinario", "RF19 - Forfettario", "RF02 - Semplificato", "RF18 - Altro / Estero"],
-            index=3 if ced_paese != "IT" else 0
-        ).split(" - ")[0]
-
-        ced_via = st.text_input("Indirizzo Fornitore", value=str(inv.get("cedente_indirizzo", "")))
-        ci1, ci2, ci3 = st.columns([2, 3, 1])
-        ced_cap = ci1.text_input("CAP Fornitore", value=str(inv.get("cedente_cap", "00100")), max_chars=12)
-        ced_com = ci2.text_input("Comune Fornitore", value=str(inv.get("cedente_comune", "Roma")))
-        ced_prov = ci3.text_input("Prov.", value=str(inv.get("cedente_provincia", "RM" if ced_paese == "IT" else ""))[:2].upper(), max_chars=2)
-
-    with col_cess:
-        st.markdown("**CLIENTE STUDIO (Cessionario / Committente)**")
-        cess_nome = st.text_input("Denominazione Cliente", value=str(inv.get("cessionario_denominazione", "")))
-        
-        cs_p1, cs_p2, cs_p3 = st.columns([1, 2, 2])
-        with cs_p1:
-            cess_paese = cs_p1.text_input("Nazione Cliente", value=str(inv.get("cessionario_paese") or "IT")[:2].upper(), max_chars=2)
-        with cs_p2:
-            cess_piva = cs_p2.text_input("Partita IVA Cliente", value=str(inv.get("cessionario_piva", "")))
-        with cs_p3:
-            cess_cf = cs_p3.text_input("Codice Fiscale Cliente", value=str(inv.get("cessionario_cf", "")))
-
-        cess_via = st.text_input("Indirizzo Sede Cliente", value=str(inv.get("cessionario_indirizzo", "")))
-        cs1, cs2, cs3 = st.columns([2, 3, 1])
-        cess_cap = cs1.text_input("CAP Cliente", value=str(inv.get("cessionario_cap", "00100")), max_chars=5)
-        cess_com = cs2.text_input("Comune Cliente", value=str(inv.get("cessionario_comune", "Roma")))
-        cess_prov = cs3.text_input("Prov. Cliente", value=str(inv.get("cessionario_provincia", "RM"))[:2].upper(), max_chars=2)
-
-    st.markdown("---")
-    st.markdown("#### 🏦 3. Riconciliazione Bancaria CONSPAY")
-    cp1, cp2, cp3 = st.columns([2, 1, 1])
-    with cp1:
-        iban_doc = st.text_input("IBAN Accredito Fornitore", value=str(inv.get("iban", "")), help="Mappato nel blocco DatiPagamento per CONSPAY.")
-    with cp2:
-        try:
-            d_scad = datetime.strptime(str(inv.get("data_scadenza", ""))[:10], "%Y-%m-%d")
-        except Exception:
-            d_scad = d_val
-        scadenza_pag = st.date_input("Scadenza Pagamento", value=d_scad)
-    with cp3:
-        metodo_default = inv.get("modalita_pagamento", "MP05")
-        metodi_list = [
-            "MP05 - Bonifico Bancario",
-            "MP08 - Carta di Pagamento",
-            "MP19 - SEPA Direct Debit / Prelievo",
-            "MP12 - RiBa",
-            "MP01 - Contanti",
-        ]
-        idx_met = {"MP05": 0, "MP08": 1, "MP19": 2, "MP12": 3, "MP01": 4}.get(metodo_default, 0)
-        metodo_pag = st.selectbox("Modalità Pagamento", metodi_list, index=idx_met).split(" - ")[0]
-
-    st.markdown("---")
-    st.markdown("#### 💰 4. Sezione Contabile, IVA, Ritenuta & Acconto")
-    ce1, ce2, ce3, ce4, ce5 = st.columns(5)
-    with ce1:
-        imponibile_1 = st.number_input("Imponibile Netto (€)", value=float(inv.get("imponibile", 0.0)), step=0.01)
-    with ce2:
-        aliquota_1 = st.number_input("Aliquota IVA (%)", value=float(inv.get("aliquota_prevalente", 22.0)), step=1.0)
-    with ce3:
-        imposta_1 = st.number_input("Imposta IVA (€)", value=float(inv.get("imposta", 0.0)), step=0.01)
-    with ce4:
-        ritenuta_1 = st.number_input("Ritenuta d'Acconto (€)", value=float(inv.get("ritenuta", 0.0)), step=0.01)
-    with ce5:
-        acconto_1 = st.number_input("Acconto già versato (€)", value=float(inv.get("acconto", 0.0)), step=0.01)
-
-    col_t1, col_t2 = st.columns([3, 1])
-    with col_t1:
-        natura_default = str(inv.get("natura") or ("N3.2" if (ced_paese != "IT" and aliquota_1 == 0.0) else ""))
-        natura_iva = st.text_input("Natura (se IVA 0%, es. N3.2 per Fornitori UE)", value=natura_default)
-    with col_t2:
-        totale_doc = st.number_input("Totale Fattura AdE (€)", value=float(inv.get("totale_documento", 0.0)), step=0.01)
-
-    lordo_live = round(imponibile_1 + imposta_1, 2)
-    netto_rit_live = round(lordo_live - ritenuta_1, 2)
-    netto_pag_live = round(max(0.0, lordo_live - ritenuta_1 - acconto_1), 2)
-    diff_live = min(abs(netto_rit_live - totale_doc), abs(lordo_live - totale_doc))
-
-    if diff_live <= 0.02:
-        msg_q = f"🟢 **Quadratura Verificata**: {imponibile_1:.2f}€ + {imposta_1:.2f}€ = {lordo_live:.2f}€"
-        if acconto_1 > 0 or ritenuta_1 > 0:
-            msg_q += f" ➔ **Netto residuo da pagare (CONSPAY): {netto_pag_live:.2f}€**"
-        st.success(msg_q)
-    else:
-        st.warning(f"🟡 **Scostamento**: Totale calcolato {lordo_live:.2f}€ vs inserito {totale_doc:.2f}€")
-
-    btn_submit = st.form_submit_button("💾 Aggiorna Modifiche e Rigenera XML", type="primary", use_container_width=True)
-
-# ---------------------------------------------------------
-# FASE 4: AGGIORNAMENTO DATI IN SESSIONE E RIGENERAZIONE
-# ---------------------------------------------------------
-if btn_submit:
-    inv["tipo_documento"] = tipo_doc
-    inv["numero_documento"] = num_doc
-    inv["data_documento"] = data_doc.strftime("%Y-%m-%d")
-    inv["codice_destinatario"] = cod_sdi
-    inv["regime_fiscale"] = regime_fiscale_selezionato
-    inv["cedente_denominazione"] = ced_nome
-    inv["cedente_paese"] = ced_paese if ced_paese else "IT"
-    inv["cedente_piva"] = ced_piva
-    inv["cedente_cf"] = ced_cf
-    inv["cedente_indirizzo"] = ced_via
-    inv["cedente_cap"] = ced_cap
-    inv["cedente_comune"] = ced_com
-    inv["cedente_provincia"] = ced_prov if ced_paese == "IT" else ""
-    inv["cessionario_denominazione"] = cess_nome
-    inv["cessionario_paese"] = cess_paese if cess_paese else "IT"
-    inv["cessionario_piva"] = cess_piva
-    inv["cessionario_cf"] = cess_cf
-    inv["cessionario_indirizzo"] = cess_via
-    inv["cessionario_cap"] = cess_cap
-    inv["cessionario_comune"] = cess_com
-    inv["cessionario_provincia"] = cess_prov
-    inv["imponibile"] = imponibile_1
-    inv["aliquota_prevalente"] = aliquota_1
-    inv["imposta"] = imposta_1
-    inv["ritenuta"] = ritenuta_1
-    inv["acconto"] = acconto_1
-    inv["totale_documento"] = totale_doc
-    inv["natura"] = natura_iva
-    inv["iban"] = iban_doc
-    inv["data_scadenza"] = scadenza_pag.strftime("%Y-%m-%d")
-    inv["modalita_pagamento"] = metodo_pag
-
-    xml_nuovo, nome_nuovo, payload_nuovo = genera_payload_e_xml(inv, cod_sdi, prog_idx=curr_idx)
-    quadratura_ok, errs = valida_quadratura_fiscale(
-        payload_nuovo["riepilogo_iva"], payload_nuovo["totale_documento"], ritenuta=payload_nuovo["ritenuta"]
-    )
-    segnalazioni = []
-    if ced_piva and not valida_partita_iva(ced_piva, ced_paese):
-        segnalazioni.append(f"P.IVA Fornitore '{ced_piva}' ({ced_paese}) non valida.")
-    if cess_piva and not valida_partita_iva(cess_piva, cess_paese):
-        segnalazioni.append(f"P.IVA Cliente '{cess_piva}' ({cess_paese}) non valida.")
-
-    curr_item["invoice_data"] = inv
-    curr_item["xml_content"] = xml_nuovo
-    curr_item["xml_filename"] = nome_nuovo
-    curr_item["validation_report"] = (quadratura_ok and len(segnalazioni) == 0, segnalazioni + errs)
-    curr_item["xml_aggiornato"] = True
-    st.session_state["invoice_cache"][curr_fid] = curr_item
-    st.rerun()
-
-# ---------------------------------------------------------
-# FASE 5: AREA DI DOWNLOAD SINGOLA FATTURA SELEZIONATA
-# ---------------------------------------------------------
-if curr_item.get("xml_content"):
-    st.markdown("---")
-    st.subheader(f"📦 Download Singola Fattura ({curr_item['orig_filename']})")
-
-    if curr_item.get("xml_aggiornato"):
-        st.success("✅ **Modifiche salvate e XML rigenerato con successo!**")
-
-    is_ok, anomalie = curr_item.get("validation_report") or (True, [])
-
-    c_down1, c_down2 = st.columns([2, 1])
-    with c_down1:
-        if is_ok:
-            st.success(f"✅ **Quadratura e Dati Fiscali Validi**: File `{curr_item['xml_filename']}` conforme AdE / SdI.")
-        else:
-            st.warning("⚠️ **Segnalazioni contabili:**")
-            for a in anomalie:
-                st.write(f"- {a}")
-
-    zip_bytes = io.BytesIO()
-    with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(curr_item["xml_filename"], curr_item["xml_content"].encode("utf-8"))
-        z.writestr(curr_item["orig_filename"], curr_item["orig_bytes"])
-    zip_bytes.seek(0)
-
-    with c_down2:
-        st.download_button(
-            label="💾 SCARICA FILE XML ORA",
-            data=curr_item["xml_content"].encode("utf-8"),
-            file_name=curr_item["xml_filename"],
-            mime="application/octet-stream",
-            key=f"btn_download_diretto_{curr_fid}",
-            use_container_width=True,
-            type="primary"
-        )
-        st.download_button(
-            label="🗂️ SCARICA PACCHETTO ZIP (PDF + XML)",
-            data=zip_bytes.getvalue(),
-            file_name=f"Fattura_{curr_item['xml_filename'].replace('.xml', '')}.zip",
-            mime="application/zip",
-            key=f"btn_download_zip_diretto_{curr_fid}",
-            use_container_width=True
-        )
-
-    with st.expander("🔍 Visualizza e Copia Testo XML"):
-        st.code(curr_item["xml_content"], language="xml")
+    render_scheda_fattura(batch_items[0])
 # === FINE FILE app.py ===
