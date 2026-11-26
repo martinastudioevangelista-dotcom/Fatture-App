@@ -1,5 +1,5 @@
 # === INIZIO FILE app.py ===
-# app.py - AI Invoice to SdI/TeamSystem CONSPAY (v3.4 Multi-Fattura Veloce & Anti-429)
+# app.py - AI Invoice to SdI/TeamSystem CONSPAY (v3.6 Multi-Fattura + Archivio Cliente/Anno/Mese)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import zipfile
@@ -33,7 +33,7 @@ def valida_quadratura_fiscale(riepilogo, totale, ritenuta=0.0):
 
     if diff_netto <= 0.02 or diff_lordo <= 0.02:
         return True, []
-    
+
     return False, [
         f"Asimmetria: Calcolato Netto {netto_calcolato:.2f}€ (Lordo {lordo_calcolato:.2f}€) vs Dichiarato {totale:.2f}€."
     ]
@@ -55,19 +55,25 @@ except Exception:
 from xml_generator import genera_xml_teamsystem
 
 try:
-    from gdrive import upload_to_drive
-    GDRIVE_OK = True
-except Exception:
-    GDRIVE_OK = False
-    def upload_to_drive(*args, **kwargs): return False, "Drive non attivo"
+    from archivio import salva_in_cartella_locale, salva_su_google_drive
+    ARCHIVIO_OK = True
+    ARCHIVIO_ERR = ""
+except Exception as e_arch:
+    ARCHIVIO_OK = False
+    ARCHIVIO_ERR = str(e_arch)
 
 for k in ["invoice_cache", "batch_order"]:
     if k not in st.session_state:
         st.session_state[k] = {} if k == "invoice_cache" else []
 
+try:
+    secrets_dict = dict(st.secrets)
+except Exception:
+    secrets_dict = {}
+
 with st.sidebar:
     st.title("⚙️ Impostazioni")
-    secret_key = st.secrets.get("GEMINI_API_KEY", "")
+    secret_key = secrets_dict.get("GEMINI_API_KEY", "")
     api_key_input = st.text_input("Google Gemini API Key", value=secret_key, type="password")
     if api_key_input and len(api_key_input.strip()) > 10:
         st.success("🟢 Chiave IA Attiva")
@@ -76,10 +82,31 @@ with st.sidebar:
 
     st.divider()
     codice_dest_default = st.text_input("Codice SdI Destinatario", value="0000000", max_chars=7)
-    salva_drive = st.checkbox("Archivia su Google Drive", value=False)
+
+    st.divider()
+    st.subheader("📁 Archivio Cliente / Mese")
+    modo_archivio = st.radio(
+        "Dove salvare le cartelle",
+        ["Google Drive (Cloud API)", "Cartella sul PC / Drive Desktop"],
+        index=0
+    )
+    if modo_archivio == "Google Drive (Cloud API)":
+        dest_archivio = st.text_input(
+            "Cartella Google Drive (Link, ID o Nome)",
+            value="Fatture_XML_SdI",
+            help="Account: martina.studio.evangelista@gmail.com. Puoi incollare il link della cartella Drive o scrivere un nome."
+        )
+    else:
+        dest_archivio = st.text_input(
+            "Percorso cartella sul PC / Mac",
+            value="./Archivio_Fatture_XML",
+            help="Es. G:/Il mio Drive/Fatture_XML oppure C:/Studio/Fatture"
+        )
+    precrea_12_mesi = st.checkbox("Crea subito tutti i 12 mesi (Gen–Dic)", value=True)
+    salva_anche_pdf = st.checkbox("Salva anche il PDF originale nel mese", value=False)
 
 st.title("🧾 AI Invoice to SdI / TeamSystem CONSPAY")
-st.caption("Fatturazione FPR12 v1.2.2 - Caricamento singolo o multiplo (consigliate max 15-25 fatture per lotto).")
+st.caption("Fatturazione FPR12 v1.2.2 - Lettura Italia/Estero e archiviazione automatica per Cliente e Mese.")
 
 def genera_payload_e_xml(dati_dict, cod_dest_val, prog_idx=1):
     ced_p = dati_dict.get("cedente_paese", "IT") or "IT"
@@ -135,6 +162,41 @@ def genera_payload_e_xml(dati_dict, cod_dest_val, prog_idx=1):
         piva_trasm = piva_trasm[2:]
     nome_file = f"IT{piva_trasm}_{prog_idx:05d}.xml"
     return xml_str, nome_file, payload
+
+def archivia_singolo_item(item):
+    if not ARCHIVIO_OK:
+        return False, f"Modulo archivio.py non disponibile: {ARCHIVIO_ERR}", False
+    d = item["invoice_data"]
+    cli_nome = d.get("cessionario_denominazione") or "CLIENTE"
+    cli_piva = d.get("cessionario_piva") or d.get("cessionario_cf") or ""
+    data_doc = d.get("data_documento") or ""
+    pdf_n = item["orig_filename"] if salva_anche_pdf else None
+    pdf_b = item["orig_bytes"] if salva_anche_pdf else None
+
+    if modo_archivio == "Google Drive (Cloud API)":
+        return salva_su_google_drive(
+            drive_destinazione=dest_archivio,
+            cliente_nome=cli_nome,
+            cliente_piva=cli_piva,
+            data_documento=data_doc,
+            xml_filename=item["xml_filename"],
+            xml_content=item["xml_content"],
+            precrea_12_mesi=precrea_12_mesi,
+            pdf_filename=pdf_n,
+            pdf_bytes=pdf_b,
+            secrets_dict=secrets_dict,
+        )
+    return salva_in_cartella_locale(
+        root_path=dest_archivio,
+        cliente_nome=cli_nome,
+        cliente_piva=cli_piva,
+        data_documento=data_doc,
+        xml_filename=item["xml_filename"],
+        xml_content=item["xml_content"],
+        precrea_12_mesi=precrea_12_mesi,
+        pdf_filename=pdf_n,
+        pdf_bytes=pdf_b,
+    )
 
 def _elabora_singolo_job(job, api_key_val, cod_dest_val):
     idx, fid, orig_name, file_bytes = job
@@ -420,6 +482,14 @@ def render_scheda_fattura(item):
                 key=f"dl_zip_{fid}",
                 use_container_width=True
             )
+            if st.button("☁️ SALVA IN ARCHIVIO (Cliente/Mese)", key=f"arch_btn_{fid}", use_container_width=True):
+                with st.spinner("Salvataggio ordinato per Cliente / Anno / Mese..."):
+                    ok_a, msg_a, nuovo_c = archivia_singolo_item(item)
+                if ok_a:
+                    tag_c = "🆕 Nuovo cliente creato" if nuovo_c else "📂 Cliente esistente riconosciuto"
+                    st.success(f"✅ {tag_c}: `{msg_a}`")
+                else:
+                    st.error(f"❌ {msg_a}")
 
         if st.checkbox("🔍 Mostra testo XML generato", key=f"show_xml_{fid}"):
             st.code(item["xml_content"], language="xml")
@@ -461,7 +531,7 @@ for idx, f in enumerate(uploaded_files, start=1):
 if jobs:
     tot_el = len(jobs)
     has_ai_key = bool(api_key_input and len(api_key_input.strip()) > 10)
-    max_w = min(2 if has_ai_key else 4, tot_el)
+    max_w = min(3 if has_ai_key else 6, tot_el)
 
     with st.status(f"Elaborazione veloce di {tot_el} fattura/e...", expanded=True) as status:
         prog_bar = st.progress(0)
@@ -487,7 +557,7 @@ st.session_state["batch_order"] = nuovi_fids
 batch_items = [st.session_state["invoice_cache"][fid] for fid in nuovi_fids]
 
 # ---------------------------------------------------------
-# RIEPILOGO E DOWNLOAD MASSIVO + SCHEDE MODIFICABILI
+# RIEPILOGO E DOWNLOAD MASSIVO + ARCHIVIAZIONE + SCHEDE
 # ---------------------------------------------------------
 if len(batch_items) > 1:
     st.markdown(f"### 📚 Riepilogo Fatture Caricate ({len(batch_items)} documenti)")
@@ -519,22 +589,28 @@ if len(batch_items) > 1:
     zip_all_full = io.BytesIO()
     nomi_usati_xml = set()
     nomi_usati_pdf = set()
-    with zipfile.ZipFile(zip_only_xml, "w", zipfile.ZIP_DEFLATED) as z_xml, \
-         zipfile.ZipFile(zip_all_full, "w", zipfile.ZIP_DEFLATED) as z_full:
+    with zipfile.ZipFile(zip_only_xml, "w", zipfile.ZIP_DEFLATED) as z_xml:
         for item in batch_items:
             x_name = item["xml_filename"]
             if x_name in nomi_usati_xml:
                 x_name = f"{item['idx']:02d}_{x_name}"
             nomi_usati_xml.add(x_name)
-            x_bytes = item["xml_content"].encode("utf-8")
-            z_xml.writestr(x_name, x_bytes)
-            z_full.writestr(x_name, x_bytes)
+            z_xml.writestr(x_name, item["xml_content"].encode("utf-8"))
 
+    nomi_usati_xml = set()
+    with zipfile.ZipFile(zip_all_full, "w", zipfile.ZIP_DEFLATED) as z_full:
+        for item in batch_items:
+            x_name = item["xml_filename"]
+            if x_name in nomi_usati_xml:
+                x_name = f"{item['idx']:02d}_{x_name}"
+            nomi_usati_xml.add(x_name)
+            z_full.writestr(x_name, item["xml_content"].encode("utf-8"))
             p_name = item["orig_filename"]
             if p_name in nomi_usati_pdf:
                 p_name = f"{item['idx']:02d}_{p_name}"
             nomi_usati_pdf.add(p_name)
             z_full.writestr(p_name, item["orig_bytes"])
+
     zip_only_xml.seek(0)
     zip_all_full.seek(0)
 
@@ -558,6 +634,30 @@ if len(batch_items) > 1:
             key="btn_dl_batch_full",
             use_container_width=True
         )
+
+    if st.button(
+        f"☁️ ARCHIVIA TUTTE LE {len(batch_items)} FATTURE PER CLIENTE E MESE ({modo_archivio})",
+        key="btn_archivia_batch",
+        use_container_width=True
+    ):
+        with st.status("Archiviazione ordinata per Cliente / Anno / Mese...", expanded=True) as st_arch:
+            bar_a = st.progress(0)
+            tot_a = len(batch_items)
+            tutti_ok = True
+            for i_a, item in enumerate(batch_items, start=1):
+                ok_a, msg_a, nuovo_c = archivia_singolo_item(item)
+                if ok_a:
+                    tag_c = "🆕 Nuovo cliente" if nuovo_c else "📂 Cliente esistente"
+                    st.write(f"✅ {tag_c} ➔ `{msg_a}`")
+                else:
+                    tutti_ok = False
+                    st.error(f"❌ {item['orig_filename']}: {msg_a}")
+                bar_a.progress(i_a / tot_a)
+            st_arch.update(
+                label="✅ Archiviazione completata!" if tutti_ok else "⚠️ Archiviazione completata con avvisi",
+                state="complete" if tutti_ok else "error",
+                expanded=True
+            )
 
     st.markdown("---")
     st.markdown("### 📝 Apri e Modifica le Singole Fatture")
